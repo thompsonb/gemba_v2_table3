@@ -1,0 +1,16 @@
+[project]
+name = "wmt23-table3-reproduction"
+version = "0.1.0"
+description = "Reproduce WMT23 metric results under the WMT24 retrofit protocol"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+  "gemba",
+  "mt-metrics-eval",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+gemba = { git = "ssh://git@github.com/thompsonb/gemba_v2_vllm.git", rev = "ede8ca437b9cd379970b331dd80ee353495ffd5c" }
+mt-metrics-eval = { path = "mt-metrics-eval", editable = true }
