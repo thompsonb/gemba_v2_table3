@@ -226,10 +226,11 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
   parser.add_argument(
       "--context-preflight",
       choices=("none", "documents", "all"),
-      default="documents",
+      default="all",
       help=(
-          "Use vLLM's actual tokenizer/chat template to check the largest "
-          "prompt per document (default), every prompt, or none"
+          "Use vLLM's actual tokenizer/chat template to check every prompt "
+          "(default) or none; 'documents' is retained as an exhaustive "
+          "compatibility alias"
       ),
   )
   parser.add_argument(
@@ -473,23 +474,11 @@ def _preflight_candidates(
 ) -> list[ScoreJob]:
   if mode == "none":
     return []
-  if mode == "all":
+  if mode in ("all", "documents"):
+    # Token count is not monotonic with character or UTF-8 byte length, so no
+    # single rendition can safely represent every prompt in a document.
     return list(jobs)
-  if mode != "documents":
-    raise ValueError(f"Unknown context preflight mode: {mode}")
-  # The source-context portion is identical for each rendition of a document.
-  # Check the segment/system payload with the most UTF-8 bytes for that
-  # document. Use `all` for an exhaustive check of every rendition.
-  representatives: dict[tuple[str, int], tuple[int, ScoreJob]] = {}
-  for job in jobs:
-    size = sum(
-        len(message["content"].encode("utf-8"))
-        for message in _messages_for_job(job, build_messages)
-    )
-    key = (job.language_pair, job.document_index)
-    if key not in representatives or size > representatives[key][0]:
-      representatives[key] = (size, job)
-  return [item[1] for item in representatives.values()]
+  raise ValueError(f"Unknown context preflight mode: {mode}")
 
 
 def _messages_for_job(
@@ -577,36 +566,51 @@ def _run_context_preflight(
   maximum_job = None
   model_limit = None
   with futures.ThreadPoolExecutor(max_workers=workers) as executor:
-    pending = {
-        executor.submit(
-            tokenizer, job, _messages_for_job(job, build_messages)
-        ): job
-        for job in candidates
-    }
+    pending: dict[futures.Future[Any], ScoreJob] = {}
+    candidate_iter = iter(candidates)
+
+    def submit_next() -> bool:
+      try:
+        job = next(candidate_iter)
+      except StopIteration:
+        return False
+      future = executor.submit(
+          tokenizer, job, _messages_for_job(job, build_messages)
+      )
+      pending[future] = job
+      return True
+
+    for _ in range(min(len(candidates), workers * 2)):
+      submit_next()
     completed = 0
-    for future in futures.as_completed(pending):
-      job = pending[future]
-      count, max_model_len = future.result()
-      completed += 1
-      if model_limit is None:
-        model_limit = max_model_len
-      elif model_limit != max_model_len:
-        raise RuntimeError(
-            "vLLM /tokenize returned inconsistent max_model_len values"
-        )
-      if count + max_tokens > max_model_len:
-        raise ValueError(
-            f"Prompt {job.key} ({job.document_id}) needs {count} input + "
-            f"{max_tokens} output tokens, exceeding model limit "
-            f"{max_model_len}; full-document context cannot be preserved"
-        )
-      if count > maximum:
-        maximum = count
-        maximum_job = job
-      if completed % progress_every == 0 or completed == len(candidates):
-        _progress(
-            f"[context] tokenized {completed}/{len(candidates)} candidates"
-        )
+    while pending:
+      done, _ = futures.wait(
+          pending, return_when=futures.FIRST_COMPLETED
+      )
+      for future in done:
+        job = pending.pop(future)
+        count, max_model_len = future.result()
+        completed += 1
+        if model_limit is None:
+          model_limit = max_model_len
+        elif model_limit != max_model_len:
+          raise RuntimeError(
+              "vLLM /tokenize returned inconsistent max_model_len values"
+          )
+        if count + max_tokens > max_model_len:
+          raise ValueError(
+              f"Prompt {job.key} ({job.document_id}) needs {count} input + "
+              f"{max_tokens} output tokens, exceeding model limit "
+              f"{max_model_len}; full-document context cannot be preserved"
+          )
+        if count > maximum:
+          maximum = count
+          maximum_job = job
+        if completed % progress_every == 0 or completed == len(candidates):
+          _progress(
+              f"[context] tokenized {completed}/{len(candidates)} candidates"
+          )
+        submit_next()
   return maximum, maximum_job, model_limit
 
 
@@ -749,6 +753,8 @@ def _read_records(
       record = json.loads(line)
     except json.JSONDecodeError as error:
       raise ValueError(f"Invalid JSON at {source}:{line_number}") from error
+    if not isinstance(record, dict):
+      raise ValueError(f"Record is not a JSON object at {source}:{line_number}")
     key = record.get("key")
     if not isinstance(key, str):
       raise ValueError(f"Missing record key at {source}:{line_number}")
@@ -761,8 +767,47 @@ def _read_records(
 def _load_records(path: Path) -> dict[str, dict[str, Any]]:
   if not path.exists():
     return {}
-  with path.open(encoding="utf-8") as file:
-    return _read_records(file, str(path))
+  records = {}
+  truncated_at = None
+  truncated_line = None
+  with path.open("rb") as file:
+    line_number = 0
+    while True:
+      line_start = file.tell()
+      line = file.readline()
+      if not line:
+        break
+      line_number += 1
+      if not line.strip():
+        continue
+      try:
+        record = json.loads(line.decode("utf-8"))
+      except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        # A process interruption can leave only the final append incomplete.
+        # Remove that tail so the next append starts at a valid JSONL boundary.
+        if not line.endswith(b"\n") and not file.read(1):
+          truncated_at = line_start
+          truncated_line = line_number
+          break
+        raise ValueError(f"Invalid JSON at {path}:{line_number}") from error
+      if not isinstance(record, dict):
+        raise ValueError(
+            f"Record is not a JSON object at {path}:{line_number}"
+        )
+      key = record.get("key")
+      if not isinstance(key, str):
+        raise ValueError(f"Missing record key at {path}:{line_number}")
+      if key in records:
+        raise ValueError(f"Duplicate record key {key!r} in {path}")
+      records[key] = record
+  if truncated_at is not None:
+    with path.open("r+b") as file:
+      file.truncate(truncated_at)
+    _progress(
+        f"[recover] removed truncated final record at "
+        f"{path}:{truncated_line}"
+    )
+  return records
 
 
 def _load_judgements(

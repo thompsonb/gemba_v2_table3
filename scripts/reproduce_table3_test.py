@@ -27,6 +27,11 @@ class ArgumentsTest(unittest.TestCase):
     self.assertNotIn("rank_cutoff", vars(args))
     self.assertNotIn("gemba_scores_dir", vars(args))
     self.assertIsNone(args.gemba_output_dir)
+    self.assertFalse(args.allow_incomplete)
+
+  def test_incomplete_gemba_scores_require_explicit_opt_in(self):
+    args = SCRIPT._parse_args(["--allow-incomplete"])
+    self.assertTrue(args.allow_incomplete)
 
   def test_metric_list_is_exactly_the_non_v2_table_rows(self):
     self.assertEqual(len(SCRIPT.TABLE3_METRICS), 29)
@@ -154,8 +159,50 @@ class GembaScoresTest(unittest.TestCase):
     self.assertAlmostEqual(scores["system"][0], -25 / 3)
     self.assertEqual(histogram, {0: 1, 2: 3})
 
+  def test_dataset_fingerprint_mismatch_is_rejected(self):
+    configuration = {"dataset_sha256": "a" * 64}
+    with self.assertRaisesRegex(ValueError, "different dataset"):
+      SCRIPT._validate_gemba_dataset(
+          configuration,
+          Path("unused"),
+          lambda unused: "b" * 64,
+      )
+
+  def test_dataset_fingerprint_match_is_accepted(self):
+    configuration = {"dataset_sha256": "a" * 64}
+    SCRIPT._validate_gemba_dataset(
+        configuration,
+        Path("unused"),
+        lambda unused: "a" * 64,
+    )
+
+  def test_incomplete_coverage_requires_opt_in(self):
+    histogram = {2: 3, 1: 1, 0: 1}
+    with self.assertRaisesRegex(ValueError, "--allow-incomplete"):
+      SCRIPT._validate_gemba_coverage(
+          "en-de", histogram, num_judgements=2, allow_incomplete=False
+      )
+    self.assertEqual(
+        SCRIPT._validate_gemba_coverage(
+            "en-de", histogram, num_judgements=2, allow_incomplete=True
+        ),
+        2,
+    )
+
 
 class VendoredDataTest(unittest.TestCase):
+
+  def test_correlation_packs_systems_in_sorted_order(self):
+    from mt_metrics_eval import data as mtme_data
+
+    correlation = mtme_data.EvalSet.Correlation(
+        None,
+        {"z-system": [2.0], "a-system": [1.0]},
+        {"z-system": [20.0], "a-system": [10.0]},
+        {"z-system", "a-system"},
+    )
+    self.assertEqual(correlation.gold_scores, [1.0, 2.0])
+    self.assertEqual(correlation.metric_scores, [10.0, 20.0])
 
   def test_curated_wmt23_file_set_and_size(self):
     root = SCRIPT.DEFAULT_DATA_DIR / "wmt23_data"

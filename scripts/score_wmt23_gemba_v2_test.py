@@ -46,6 +46,7 @@ class ArgumentsTest(unittest.TestCase):
     self.assertEqual(args.max_tokens, 4096)
     self.assertEqual(args.max_inflight_judgements, 128)
     self.assertEqual(args.seed, 0)
+    self.assertEqual(args.context_preflight, "all")
     self.assertIsNone(args.base_urls)
     self.assertEqual(args.data_dir, SCRIPT.DEFAULT_DATA_DIR)
     self.assertTrue((args.data_dir / "wmt23_data").is_dir())
@@ -157,7 +158,7 @@ class SegmentationTest(unittest.TestCase):
           assignments[SCRIPT._document_key(job)],
       )
 
-  def test_document_preflight_selects_one_candidate_per_document(self):
+  def test_legacy_document_preflight_alias_is_exhaustive(self):
     jobs = SCRIPT._build_jobs({"en-de": _fake_eval_set()})
 
     def BuildMessages(**values):
@@ -169,11 +170,7 @@ class SegmentationTest(unittest.TestCase):
     candidates = SCRIPT._preflight_candidates(
         jobs, "documents", BuildMessages
     )
-    self.assertEqual(len(candidates), 2)
-    self.assertEqual(
-        {candidate.document_id for candidate in candidates},
-        {"document-a", "document-b"},
-    )
+    self.assertEqual(candidates, jobs)
 
   def test_context_preflight_reserves_output_tokens(self):
     jobs = SCRIPT._build_jobs(
@@ -463,6 +460,38 @@ class DispatchTest(unittest.TestCase):
 
 
 class PersistenceTest(unittest.TestCase):
+
+  def test_truncated_final_record_is_removed_before_resume(self):
+    valid_record = {"key": "complete", "score": 0.0}
+    valid_line = json.dumps(valid_record).encode("utf-8") + b"\n"
+    with tempfile.TemporaryDirectory() as temp_dir:
+      path = Path(temp_dir) / "judgements.jsonl"
+      path.write_bytes(valid_line + b'{"key":"partial"')
+      self.assertEqual(
+          SCRIPT._load_records(path), {"complete": valid_record}
+      )
+      self.assertEqual(path.read_bytes(), valid_line)
+      resumed_record = {"key": "resumed", "score": -1.0}
+      with path.open("a", encoding="utf-8") as file:
+        file.write(json.dumps(resumed_record) + "\n")
+      self.assertEqual(SCRIPT._load_records(path), {
+          "complete": valid_record,
+          "resumed": resumed_record,
+      })
+
+  def test_malformed_complete_final_record_is_rejected(self):
+    with tempfile.TemporaryDirectory() as temp_dir:
+      path = Path(temp_dir) / "judgements.jsonl"
+      path.write_bytes(b'{"key":"broken"\n')
+      with self.assertRaisesRegex(ValueError, "Invalid JSON"):
+        SCRIPT._load_records(path)
+
+  def test_non_object_record_is_rejected(self):
+    with tempfile.TemporaryDirectory() as temp_dir:
+      path = Path(temp_dir) / "judgements.jsonl"
+      path.write_text("[]\n", encoding="utf-8")
+      with self.assertRaisesRegex(ValueError, "not a JSON object"):
+        SCRIPT._load_records(path)
 
   def test_duplicate_judgement_record_is_rejected(self):
     with tempfile.TemporaryDirectory() as temp_dir:

@@ -213,11 +213,11 @@ between resumptions because they do not change the scores. Failed judgments are
 reported in the main log but are not persisted separately; their absent keys in
 `judgements/` cause them to be retried on the next run.
 
-Before scoring, the default `--context-preflight documents` uses vLLM's
-`/tokenize` endpoint and actual chat template to check the largest rendered
-prompt for each document, reserving the default 4,096 `--max-tokens` within the
-model limit. Use `--context-preflight all` for an exhaustive check of all
-68,130 prompts.
+Before scoring, the default `--context-preflight all` uses vLLM's `/tokenize`
+endpoint and actual chat template to check all 68,130 rendered prompts while
+reserving the default 4,096 `--max-tokens` within the model limit. The legacy
+`--context-preflight documents` spelling is retained as an exhaustive alias;
+UTF-8 or character length cannot safely identify the largest tokenized prompt.
 
 Add the saved judgments directly to the reproduced table with:
 
@@ -225,6 +225,7 @@ Add the saved judgments directly to the reproduced table with:
 uv run --frozen python scripts/reproduce_table3.py \
   --permutations 0 \
   --gemba-output-dir gemba-v2-all-qwen35-t04-n10-4k \
+  --allow-incomplete \
   --output table3-with-gemba-v2.txt
 ```
 
@@ -241,6 +242,11 @@ includes the published `gemba-v2-gpt-4.1-mini-rrwa[noref]` Table 3 row. That
 official row uses the paper's reported aggregate values because its underlying
 segment judgments are not in the WMT23 MTME bundle. No derived metric-score
 files are written.
+
+`--allow-incomplete` is required for the checked-in historical archives because
+some segments contain fewer than ten successful judgments. Omit the flag for a
+new complete run so the table command fails instead of silently applying
+backoffs to unfinished data.
 
 ## Test
 

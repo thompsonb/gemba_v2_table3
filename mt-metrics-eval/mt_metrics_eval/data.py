@@ -340,7 +340,10 @@ class EvalSet:
       raise ValueError(f'Missing gold scores: {sys_names - set(gold_scores)}')
 
     all_gold_scores, all_metric_scores = [], []
-    for sys_name in sys_names:
+    # Sets have process-dependent iteration order. Keep score packing stable so
+    # floating-point statistics such as PCE are reproducible across processes.
+    ordered_sys_names = sorted(sys_names)
+    for sys_name in ordered_sys_names:
       gscores, mscores = gold_scores[sys_name], metric_scores[sys_name]
       if indexes is not None:
         gscores = np.asarray(gscores)[indexes]
@@ -350,7 +353,8 @@ class EvalSet:
                          (sys_name, len(gscores), len(mscores)))
       all_gold_scores.extend(gscores)
       all_metric_scores.extend(mscores)
-    return stats.Correlation(len(sys_names), all_gold_scores, all_metric_scores)
+    return stats.Correlation(
+        len(ordered_sys_names), all_gold_scores, all_metric_scores)
 
   def ParseHumanScoreFilename(self, filename, rating_file=False):
     """Parse a human-score/rating filename into lang, name, level components."""

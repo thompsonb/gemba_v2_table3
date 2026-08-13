@@ -139,6 +139,14 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
       ),
   )
   parser.add_argument(
+      "--allow-incomplete",
+      action="store_true",
+      help=(
+          "Allow GEMBA rows with fewer than the configured judgments for any "
+          "segment, using the documented partial aggregation and imputation"
+      ),
+  )
+  parser.add_argument(
       "--format",
       choices=("text", "tsv", "latex"),
       default="text",
@@ -241,7 +249,27 @@ def _gemba_configuration(output_dir: Path) -> dict[str, Any]:
   num_judgements = configuration.get("num_judgements")
   if not isinstance(num_judgements, int) or num_judgements < 1:
     raise ValueError(f"Invalid num_judgements in {manifest_path}")
+  dataset_sha256 = configuration.get("dataset_sha256")
+  if (
+      not isinstance(dataset_sha256, str)
+      or re.fullmatch(r"[0-9a-f]{64}", dataset_sha256) is None
+  ):
+    raise ValueError(f"Invalid dataset_sha256 in {manifest_path}")
   return configuration
+
+
+def _validate_gemba_dataset(
+    configuration: dict[str, Any],
+    data_root: Path,
+    dataset_fingerprint: Any,
+) -> None:
+  recorded = configuration["dataset_sha256"]
+  actual = dataset_fingerprint(data_root)
+  if actual != recorded:
+    raise ValueError(
+        "GEMBA judgments were generated from a different dataset: "
+        f"manifest={recorded}, selected={actual}"
+    )
 
 
 def _gemba_metric_name(model: str) -> tuple[str, str]:
@@ -353,12 +381,35 @@ def _aggregate_gemba_records(
   return completed_scores, judgment_count_histogram
 
 
+def _validate_gemba_coverage(
+    language_pair: str,
+    judgment_count_histogram: dict[int, int],
+    num_judgements: int,
+    allow_incomplete: bool,
+) -> int:
+  backoffs = sum(
+      count
+      for judgments, count in judgment_count_histogram.items()
+      if judgments < num_judgements
+  )
+  if backoffs and not allow_incomplete:
+    raise ValueError(
+        f"GEMBA judgments are incomplete for {language_pair}: {backoffs} "
+        "segments have fewer than the configured number of judgments; "
+        "rerun the scorer or pass --allow-incomplete to use backoffs"
+    )
+  return backoffs
+
+
 def _add_gemba_scores(
     eval_sets: dict[tuple[str, str], Any],
     output_dir: Path,
+    data_root: Path,
     aggregate_scores: Any,
+    allow_incomplete: bool,
 ) -> str:
   try:
+    from score_wmt23_gemba_v2 import _dataset_fingerprint
     from score_wmt23_gemba_v2 import _load_judgements
   except ModuleNotFoundError as error:
     raise RuntimeError(
@@ -366,6 +417,9 @@ def _add_gemba_scores(
     ) from error
 
   configuration = _gemba_configuration(output_dir)
+  _validate_gemba_dataset(
+      configuration, data_root, _dataset_fingerprint
+  )
   num_judgements = configuration["num_judgements"]
   metric_basename, metric_display_name = _gemba_metric_name(
       configuration["model"]
@@ -380,13 +434,14 @@ def _add_gemba_scores(
         num_judgements,
         aggregate_scores,
     )
+    backoffs = _validate_gemba_coverage(
+        language_pair,
+        judgment_count_histogram,
+        num_judgements,
+        allow_incomplete,
+    )
     eval_set.AddMetric(metric_basename, set(), "seg", scores)
     eval_set.SetPrimaryMetrics(eval_set.metric_basenames)
-    backoffs = sum(
-        count
-        for judgments, count in judgment_count_histogram.items()
-        if judgments < num_judgements
-    )
     histogram = ", ".join(
         f"n={judgments}: {count}"
         for judgments, count in sorted(judgment_count_histogram.items())
@@ -660,7 +715,9 @@ def main(argv: Sequence[str] | None = None) -> int:
       local_gemba_metric = _add_gemba_scores(
           eval_sets,
           gemba_output_dir,
+          data_root,
           aggregate_scores,
+          args.allow_incomplete,
       )
     results, weights = _run_tasks(
         tasks_module,
