@@ -13,6 +13,8 @@ Create/update the uv environment from this directory:
 
 ```bash
 uv sync --frozen
+
+sudo apt-get install python3.12-dev
 ```
 
 The uv project pins Python 3.12 via `.python-version`, installs the minimal
