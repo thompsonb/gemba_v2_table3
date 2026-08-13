@@ -7,8 +7,8 @@ individual-run result, because those scores are not part of that bundle.
 It also excludes human-system outputs, matching the population used for the
 published Table 3 values.
 
-Locally generated GEMBA-MQM V2 scores can be added with
-``--extra-metric-dir OUTPUT/mtme``.
+Locally generated GEMBA-MQM V2 scores can be added directly from a scorer
+output directory with ``--gemba-output-dir OUTPUT``.
 
 No expected paper values are embedded in the script. The calculations use the
 repository's WMT24-on-WMT23 task definition:
@@ -31,7 +31,10 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Sequence
+import json
+import math
 from pathlib import Path
+import re
 import sys
 import time
 from typing import Any
@@ -40,7 +43,19 @@ from typing import Any
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATA_DIR = PROJECT_ROOT / "mt-metrics-eval"
 LANGUAGE_PAIRS = ("en-de", "he-en", "zh-en")
-GEMBA_V2_METRIC = "GEMBA-MQM-V2[noref]"
+PUBLISHED_GEMBA_V2_METRIC = "gemba-v2-gpt-4.1-mini-rrwa[noref]"
+PUBLISHED_GEMBA_V2_AVERAGE = 0.760
+# Published Table 3 point estimates and significance-cluster ranks. The paper
+# does not distribute the underlying segment scores in the WMT23 MTME bundle,
+# so this comparison row cannot be recomputed here.
+PUBLISHED_GEMBA_V2_TASK_RESULTS = (
+    (0.977, 2),
+    (0.597, 7),
+    (0.948, 8),
+    (0.566, 7),
+    (0.920, 4),
+    (0.549, 3),
+)
 
 # Stored MTME metrics present in Table 3, in the paper's displayed order.
 # GEMBA-MQM V2 and its individual runs are intentionally absent.
@@ -116,11 +131,11 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
       help="NumPy seed for significance resampling (default: 0)",
   )
   parser.add_argument(
-      "--extra-metric-dir",
+      "--gemba-output-dir",
       type=Path,
       help=(
-          "Additional MTME root containing wmt23/metric-scores/, such as "
-          "the OUTPUT/mtme directory produced by score_wmt23_gemba_v2.py"
+          "Output directory produced by score_wmt23_gemba_v2.py; saved "
+          "judgments are aggregated in memory and added as GEMBA-MQM V2"
       ),
   )
   parser.add_argument(
@@ -146,14 +161,17 @@ def _resolve_data_root(path: Path) -> Path:
   return root
 
 
-def _resolve_extra_metric_root(path: Path | None) -> Path | None:
+def _resolve_gemba_output_dir(path: Path | None) -> Path | None:
   if path is None:
     return None
   root = path.expanduser().resolve()
-  metric_root = root / "wmt23" / "metric-scores"
-  if not metric_root.is_dir():
+  if not (root / "manifest.json").is_file():
     raise ValueError(
-        f"Extra metric root does not contain wmt23/metric-scores/: {root}"
+        f"GEMBA output directory does not contain manifest.json: {root}"
+    )
+  if not (root / "judgements").is_dir():
+    raise ValueError(
+        f"GEMBA output directory does not contain judgements/: {root}"
     )
   return root
 
@@ -163,9 +181,10 @@ def _progress(message: str) -> None:
   print(message, file=sys.stderr, flush=True)
 
 
-def _import_mtme() -> tuple[Any, Any, Any, Any]:
+def _import_mtme() -> tuple[Any, Any, Any, Any, Any]:
   try:
     import numpy as np
+    from gemba.scoring import aggregate_scores
     from mt_metrics_eval import data
     from mt_metrics_eval import meta_info
     from mt_metrics_eval import tasks
@@ -176,13 +195,12 @@ def _import_mtme() -> tuple[Any, Any, Any, Any]:
         "with `uv run --frozen python scripts/reproduce_table3.py`. "
         f"Original error: {error}"
     ) from error
-  return data, meta_info, tasks, np
+  return data, meta_info, tasks, np, aggregate_scores
 
 
 def _build_eval_sets(
     data_module: Any,
     data_root: Path,
-    extra_metric_root: Path | None = None,
 ) -> dict[tuple[str, str], Any]:
   eval_sets = {}
   for language_pair in LANGUAGE_PAIRS:
@@ -193,11 +211,7 @@ def _build_eval_sets(
         "wmt23",
         language_pair,
         read_stored_metric_scores=True,
-        path=(
-            [str(data_root), str(extra_metric_root)]
-            if extra_metric_root
-            else str(data_root)
-        ),
+        path=str(data_root),
     )
     # Evaluate every stored variant. Mark all basenames primary only to avoid
     # adding contrastive-submission markers to the reproduced row labels.
@@ -208,6 +222,182 @@ def _build_eval_sets(
         f"{len(eval_set.metric_names)} metric variants"
     )
   return eval_sets
+
+
+def _gemba_configuration(output_dir: Path) -> dict[str, Any]:
+  manifest_path = output_dir / "manifest.json"
+  try:
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+  except json.JSONDecodeError as error:
+    raise ValueError(f"Invalid JSON in {manifest_path}") from error
+  configuration = manifest.get("configuration")
+  if not isinstance(configuration, dict):
+    raise ValueError(f"Missing configuration in {manifest_path}")
+  if configuration.get("test_set") != "wmt23":
+    raise ValueError(f"GEMBA output is not for wmt23: {manifest_path}")
+  model = configuration.get("model")
+  if not isinstance(model, str) or not model.strip():
+    raise ValueError(f"Invalid model in {manifest_path}")
+  num_judgements = configuration.get("num_judgements")
+  if not isinstance(num_judgements, int) or num_judgements < 1:
+    raise ValueError(f"Invalid num_judgements in {manifest_path}")
+  return configuration
+
+
+def _gemba_metric_name(model: str) -> tuple[str, str]:
+  model_name = model.strip().rstrip("/").rsplit("/", 1)[-1].lower()
+  model_slug = re.sub(r"[^a-z0-9.]+", "-", model_name).strip("-")
+  if not model_slug:
+    raise ValueError(f"Cannot derive a metric name from model {model!r}")
+  basename = f"gemba-v2-{model_slug}-rrwa"
+  return basename, f"{basename}[noref]"
+
+
+def _aggregate_gemba_records(
+    eval_set: Any,
+    language_pair: str,
+    records: dict[str, dict[str, Any]],
+    num_judgements: int,
+    aggregate_scores: Any,
+) -> tuple[dict[str, list[float]], dict[int, int]]:
+  indexed = {
+      system: [dict() for _ in eval_set.src]
+      for system in eval_set.sys_outputs
+  }
+  for key, record in records.items():
+    if record.get("language_pair") != language_pair:
+      raise ValueError(f"Judgment {key!r} has the wrong language pair")
+    system = record.get("system")
+    if system not in indexed:
+      raise ValueError(f"Judgment {key!r} has unknown system {system!r}")
+    segment_index = record.get("global_segment_index")
+    if (
+        not isinstance(segment_index, int)
+        or not 0 <= segment_index < len(eval_set.src)
+    ):
+      raise ValueError(f"Judgment {key!r} has an invalid segment index")
+    judgement_index = record.get("judgement_index")
+    if (
+        not isinstance(judgement_index, int)
+        or not 0 <= judgement_index < num_judgements
+    ):
+      raise ValueError(f"Judgment {key!r} has an invalid judgment index")
+    score = record.get("score")
+    if not isinstance(score, (int, float)) or not math.isfinite(score):
+      raise ValueError(f"Judgment {key!r} has an invalid score")
+    segment = indexed[system][segment_index]
+    if judgement_index in segment:
+      raise ValueError(
+          f"Duplicate judgment index {judgement_index} for "
+          f"{language_pair}/{system}/{segment_index}"
+      )
+    segment[judgement_index] = float(score)
+
+  judgment_count_histogram: dict[int, int] = {}
+  scores: dict[str, list[float | None]] = {}
+  for system, segments in indexed.items():
+    scores[system] = []
+    for segment in segments:
+      count = len(segment)
+      judgment_count_histogram[count] = (
+          judgment_count_histogram.get(count, 0) + 1
+      )
+      if count:
+        scores[system].append(aggregate_scores([
+            segment[index] for index in sorted(segment)
+        ]))
+      else:
+        scores[system].append(None)
+
+  observed = [
+      score
+      for system_scores in scores.values()
+      for score in system_scores
+      if score is not None
+  ]
+  if not observed:
+    raise ValueError(f"No GEMBA judgments found for {language_pair}")
+  language_pair_mean = sum(observed) / len(observed)
+  system_means = {
+      system: sum(observed_scores) / len(observed_scores)
+      for system, system_scores in scores.items()
+      if (observed_scores := [
+          score for score in system_scores if score is not None
+      ])
+  }
+  segment_means = []
+  for segment_index in range(len(eval_set.src)):
+    observed_scores = [
+        system_scores[segment_index]
+        for system_scores in scores.values()
+        if system_scores[segment_index] is not None
+    ]
+    segment_means.append(
+        sum(observed_scores) / len(observed_scores)
+        if observed_scores
+        else language_pair_mean
+    )
+
+  completed_scores: dict[str, list[float]] = {}
+  for system, system_scores in scores.items():
+    system_mean = system_means.get(system, language_pair_mean)
+    completed_scores[system] = [
+        float(score)
+        if score is not None
+        else min(
+            0.0,
+            system_mean + segment_means[segment_index] - language_pair_mean,
+        )
+        for segment_index, score in enumerate(system_scores)
+    ]
+  return completed_scores, judgment_count_histogram
+
+
+def _add_gemba_scores(
+    eval_sets: dict[tuple[str, str], Any],
+    output_dir: Path,
+    aggregate_scores: Any,
+) -> str:
+  try:
+    from score_wmt23_gemba_v2 import _load_judgements
+  except ModuleNotFoundError as error:
+    raise RuntimeError(
+        "Could not import scripts/score_wmt23_gemba_v2.py"
+    ) from error
+
+  configuration = _gemba_configuration(output_dir)
+  num_judgements = configuration["num_judgements"]
+  metric_basename, metric_display_name = _gemba_metric_name(
+      configuration["model"]
+  )
+  for language_pair in LANGUAGE_PAIRS:
+    records = _load_judgements(output_dir, language_pair)
+    eval_set = eval_sets[("wmt23", language_pair)]
+    scores, judgment_count_histogram = _aggregate_gemba_records(
+        eval_set,
+        language_pair,
+        records,
+        num_judgements,
+        aggregate_scores,
+    )
+    eval_set.AddMetric(metric_basename, set(), "seg", scores)
+    eval_set.SetPrimaryMetrics(eval_set.metric_basenames)
+    backoffs = sum(
+        count
+        for judgments, count in judgment_count_histogram.items()
+        if judgments < num_judgements
+    )
+    histogram = ", ".join(
+        f"n={judgments}: {count}"
+        for judgments, count in sorted(judgment_count_histogram.items())
+    )
+    _progress(
+        f"[gemba] {language_pair}: aggregated {len(records)} judgments "
+        f"into {sum(map(len, scores.values()))} segment scores; "
+        f"{backoffs} segment backoffs ({histogram})"
+    )
+  _progress(f"[gemba] local metric row: {metric_display_name}")
+  return metric_display_name
 
 
 def _run_tasks(
@@ -378,12 +568,18 @@ def _build_table(
     weights: Sequence[float],
     permutations: int,
     output_format: str,
-    include_gemba_v2: bool = False,
+    local_gemba_metric: str | None = None,
 ) -> str:
-  average_scores = results.AverageCorrs(weights)
+  average_scores = dict(results.AverageCorrs(weights))
   requested_metrics = list(TABLE3_METRICS)
-  if include_gemba_v2:
-    requested_metrics.append(GEMBA_V2_METRIC)
+  if local_gemba_metric:
+    requested_metrics.extend((
+        PUBLISHED_GEMBA_V2_METRIC,
+        local_gemba_metric,
+    ))
+    average_scores[PUBLISHED_GEMBA_V2_METRIC] = (
+        PUBLISHED_GEMBA_V2_AVERAGE
+    )
   missing = [metric for metric in requested_metrics if metric not in average_scores]
   if missing:
     raise ValueError(
@@ -405,10 +601,22 @@ def _build_table(
   for result in results.results:
     level = result.attr_vals["level"]
     corr_fcn = result.attr_vals["corr_fcn"]
-    statistic = "acc-t" if corr_fcn == "KendallWithTiesOpt" else corr_fcn
+    statistic = {
+        "KendallWithTiesOpt": "acc-t",
+        "pce": "SPA",
+    }.get(corr_fcn, corr_fcn)
     statistic_header.append(f"{level} ({statistic})")
 
-  task_columns = [result.corr_ranks for result in results.results]
+  task_columns = [dict(result.corr_ranks) for result in results.results]
+  if local_gemba_metric:
+    if len(task_columns) != len(PUBLISHED_GEMBA_V2_TASK_RESULTS):
+      raise ValueError(
+          "Published GEMBA V2 row does not match the number of table tasks"
+      )
+    for column, published_result in zip(
+        task_columns, PUBLISHED_GEMBA_V2_TASK_RESULTS
+    ):
+      column[PUBLISHED_GEMBA_V2_METRIC] = published_result
   headers = [language_header, statistic_header]
   if permutations == 0:
     return _point_estimate_table(
@@ -433,16 +641,27 @@ def main(argv: Sequence[str] | None = None) -> int:
   args = _parse_args(argv)
   try:
     data_root = _resolve_data_root(args.data_dir)
-    extra_metric_root = _resolve_extra_metric_root(args.extra_metric_dir)
+    gemba_output_dir = _resolve_gemba_output_dir(args.gemba_output_dir)
     _progress(f"[setup] MTME data: {data_root}")
-    if extra_metric_root:
-      _progress(f"[setup] extra metrics: {extra_metric_root}")
+    if gemba_output_dir:
+      _progress(f"[setup] GEMBA judgments: {gemba_output_dir}")
     _progress("[setup] importing mt-metrics-eval")
-    data_module, meta_info_module, tasks_module, numpy_module = _import_mtme()
+    (
+        data_module,
+        meta_info_module,
+        tasks_module,
+        numpy_module,
+        aggregate_scores,
+    ) = _import_mtme()
     _progress("[setup] imports complete")
-    eval_sets = _build_eval_sets(
-        data_module, data_root, extra_metric_root
-    )
+    eval_sets = _build_eval_sets(data_module, data_root)
+    local_gemba_metric = None
+    if gemba_output_dir:
+      local_gemba_metric = _add_gemba_scores(
+          eval_sets,
+          gemba_output_dir,
+          aggregate_scores,
+      )
     results, weights = _run_tasks(
         tasks_module,
         numpy_module,
@@ -458,7 +677,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         weights,
         args.permutations,
         args.format,
-        include_gemba_v2=extra_metric_root is not None,
+        local_gemba_metric=local_gemba_metric,
     )
   except KeyboardInterrupt:
     _progress("[stopped] interrupted by user")

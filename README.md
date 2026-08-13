@@ -42,7 +42,7 @@ uv run --frozen python scripts/reproduce_table3.py \
 ```
 
 To use a non-default MTME data location, add `--data-dir PATH`. The documented
-command computes all PCE, acc-t, and average values while skipping the slow
+command computes all SPA, acc-t, and average values while skipping the slow
 significance-cluster calculation. Per-task rank annotations are omitted in
 this mode because ordinary ranks are not the paper's significance clusters.
 The average column retains a rank recalculated over the 29 displayed metrics.
@@ -50,7 +50,7 @@ Omit `--permutations 0` to use the script's default of 1,000 significance-test
 permutations when cluster ranks among the stored metrics are needed.
 
 The script prints flushed progress messages to standard error before and after
-loading each language pair and evaluating each of the six tasks. During a PCE
+loading each language pair and evaluating each of the six tasks. During an SPA
 task, it also reports each metric point estimate. When significance testing is
 enabled, it additionally reports each metric-pair test.
 
@@ -155,19 +155,22 @@ uv run --frozen python scripts/score_wmt23_gemba_v2.py \
 ```
 
 For the full paper-style run, score all three language pairs and all MTME
-systems, including the reference/human outputs required by a complete
-source-based MTME score file:
+systems in one direct `n=10` run. This includes the reference/human outputs
+required by a complete source-based MTME score file:
 
 ```bash
 nohup uv run --frozen python scripts/score_wmt23_gemba_v2.py \
   --model Qwen/Qwen3.5-35B-A3B-FP8 \
   --base-url http://127.0.0.1:8000/v1 \
   --base-url http://127.0.0.1:8001/v1 \
+  --num-judgements 10 \
+  --temperature 0.4 \
   --max-tokens 4096 \
+  --seed 0 \
   --max-inflight-judgements 128 \
-  --output-dir gemba-v2-scores \
-  > gemba-v2-full.log 2>&1 &
-echo $! > gemba-v2-full.pid
+  --output-dir gemba-v2-all-qwen35-t04-n10-4k \
+  > gemba-v2-all-qwen35-t04-n10-4k.log 2>&1 &
+echo $! > gemba-v2-all-qwen35-t04-n10-4k.pid
 ```
 
 `--max-inflight-judgements` is a hard per-endpoint generation budget. The
@@ -175,31 +178,40 @@ scorer sends every judgment as an independent `n=1` API request, so the same
 value works for every `--num-judgements` setting. With the settings above, each
 endpoint runs at most 128 requests, for at most 256 generating judgments across
 both GPUs. A segment's successful judgments are flushed immediately under
-`judgements/`; only a failed judgment is retried. Once all ten judgments for a
-segment are present, the scorer aggregates them and appends its completed raw
-segment record.
+`judgements/`; only a failed judgment is retried. Completed segment aggregates
+are rebuilt in memory from those saved judgments and are not stored in a
+second, duplicative format.
+`--seed` names a deterministic sampling run. Each request seed is a stable hash
+of the segment key, this base seed, and the judgment index. Reusing a base seed
+reproduces or resumes the same judgments; changing it selects a fresh set rather
+than shifting the previous run's seeds by one.
 The scorer assigns complete documents to endpoints with a deterministic,
 workload-balanced partition. Every system and segment belonging to one
 document therefore reaches the same server and can reuse that server's prefix
 cache. Requests are also queued in document groups to keep matching prefixes
 close together before cache pressure can evict them. A single scorer process
-owns all output files, retries, and exports.
+owns all output files and retries.
 
 Follow the full run with:
 
 ```bash
-tail -f gemba-v2-full.log
+tail -f gemba-v2-all-qwen35-t04-n10-4k.log
 ```
 
 The full run contains 68,130 segments and 681,300 independent `n=1` API
 requests. Successful judgments are flushed immediately to
-`gemba-v2-scores/judgements/*.jsonl`; completed segments are written to
-`gemba-v2-scores/raw/*.jsonl`. Rerun the identical command to retain completed
-judgments and retry only unfinished ones. A
+`gemba-v2-all-qwen35-t04-n10-4k/judgements/*.jsonl`. After a language pair is
+complete, its JSONL file is atomically replaced by a verified `*.jsonl.zip`
+archive. The uncompressed JSONL remains untouched until the temporary ZIP has
+been closed and CRC-checked, so interruption during compression cannot destroy
+the resumable input. The archives are the sole successful-result store after
+completion and are read directly when resuming. Rerun the identical command to
+rebuild completion state and retry only unfinished judgments. A
 manifest prevents accidentally mixing model, prompt, dataset, or sampling
 configurations in one output directory. The replica URLs and count may change
-between resumptions because they do not change the scores. Failures are logged
-separately under `errors/`.
+between resumptions because they do not change the scores. Failed judgments are
+reported in the main log but are not persisted separately; their absent keys in
+`judgements/` cause them to be retried on the next run.
 
 Before scoring, the default `--context-preflight documents` uses vLLM's
 `/tokenize` endpoint and actual chat template to check the largest rendered
@@ -207,24 +219,28 @@ prompt for each document, reserving the default 4,096 `--max-tokens` within the
 model limit. Use `--context-preflight all` for an exhaustive check of all
 68,130 prompts.
 
-When a language pair is complete, the scorer exports the aggregate and ten
-individual-run metric files under:
-
-```text
-gemba-v2-scores/mtme/wmt23/metric-scores/LANGUAGE_PAIR/
-```
-
-Add the aggregate result to the reproduced table with:
+Add the saved judgments directly to the reproduced table with:
 
 ```bash
 uv run --frozen python scripts/reproduce_table3.py \
   --permutations 0 \
-  --extra-metric-dir gemba-v2-scores/mtme \
+  --gemba-output-dir gemba-v2-all-qwen35-t04-n10-4k \
   --output table3-with-gemba-v2.txt
 ```
 
-If scoring is already complete but exports need to be recreated, rerun the
-batch scorer with the same model/configuration and add `--export-only`.
+The Table 3 script reads the compressed judgment files, applies GEMBA's
+aggregation function in memory, and adds the resulting source-based segment
+metric directly to MTME. If a historical or interrupted run has fewer than the
+requested judgments for a segment, it aggregates those available; a segment
+with no judgments is estimated as its system mean plus its segment mean minus
+the language-pair mean, capped at zero. The script reports the exact backoff
+counts. The local row name is derived from the model recorded in the run
+manifest; the command above produces
+`gemba-v2-qwen3.5-35b-a3b-fp8-rrwa[noref]`. For comparison, the table also
+includes the published `gemba-v2-gpt-4.1-mini-rrwa[noref]` Table 3 row. That
+official row uses the paper's reported aggregate values because its underlying
+segment judgments are not in the WMT23 MTME bundle. No derived metric-score
+files are written.
 
 ## Test
 

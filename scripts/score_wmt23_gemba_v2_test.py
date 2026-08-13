@@ -36,14 +36,6 @@ def _fake_eval_set():
   )
 
 
-def _record(language_pair, system, segment_index, score, run_scores):
-  return {
-      "key": SCRIPT._record_key(language_pair, system, segment_index),
-      "score": score,
-      "run_scores": run_scores,
-  }
-
-
 class ArgumentsTest(unittest.TestCase):
 
   def test_defaults_cover_all_systems_and_paper_parameters(self):
@@ -57,6 +49,7 @@ class ArgumentsTest(unittest.TestCase):
     self.assertIsNone(args.base_urls)
     self.assertEqual(args.data_dir, SCRIPT.DEFAULT_DATA_DIR)
     self.assertTrue((args.data_dir / "wmt23_data").is_dir())
+    self.assertNotIn("export_only", vars(args))
 
   def test_base_url_can_be_repeated(self):
     args = SCRIPT._parse_args([
@@ -108,10 +101,46 @@ class SegmentationTest(unittest.TestCase):
     with self.assertRaisesRegex(ValueError, "Non-contiguous"):
       SCRIPT._validate_eval_set("en-de", eval_set)
 
-  def test_stable_seed_depends_on_job_key(self):
-    first = SCRIPT._stable_seed(0, "en-de\tsystem\t0")
-    self.assertEqual(first, SCRIPT._stable_seed(0, "en-de\tsystem\t0"))
-    self.assertNotEqual(first, SCRIPT._stable_seed(0, "en-de\tsystem\t1"))
+  def test_stable_seed_depends_on_complete_judgement_identity(self):
+    first = SCRIPT._stable_seed(
+        "en-de\tsystem\t0", base_seed=0, judgement_index=0
+    )
+    self.assertEqual(
+        first,
+        SCRIPT._stable_seed(
+            "en-de\tsystem\t0", base_seed=0, judgement_index=0
+        ),
+    )
+    self.assertNotEqual(
+        first,
+        SCRIPT._stable_seed(
+            "en-de\tsystem\t1", base_seed=0, judgement_index=0
+        ),
+    )
+    self.assertNotEqual(
+        first,
+        SCRIPT._stable_seed(
+            "en-de\tsystem\t0", base_seed=0, judgement_index=1
+        ),
+    )
+
+  def test_base_seeds_select_disjoint_judgement_seeds(self):
+    segment_key = "en-de\tAIRC\t42"
+    first_run = {
+        SCRIPT._stable_seed(
+            segment_key, base_seed=0, judgement_index=index
+        )
+        for index in range(10)
+    }
+    second_run = {
+        SCRIPT._stable_seed(
+            segment_key, base_seed=1, judgement_index=index
+        )
+        for index in range(10)
+    }
+    self.assertEqual(len(first_run), 10)
+    self.assertEqual(len(second_run), 10)
+    self.assertTrue(first_run.isdisjoint(second_run))
 
   def test_document_routing_never_splits_a_document(self):
     jobs = SCRIPT._build_jobs({"en-de": _fake_eval_set()})
@@ -271,21 +300,29 @@ class DispatchTest(unittest.TestCase):
           retry_backoff=0,
           progress_every=len(jobs),
           aggregate_scores=lambda scores: sum(scores) / len(scores),
-          remove_outliers=list,
       )
       persisted = SCRIPT._load_records(
           output_dir / "judgements" / "en-de.jsonl"
       )
+      self.assertFalse((output_dir / "raw").exists())
+      self.assertFalse((output_dir / "errors").exists())
     self.assertEqual(failures, 0)
     self.assertEqual(len(records), len(jobs))
     self.assertEqual(len(judgements), len(jobs) * 2)
     self.assertEqual(persisted, judgements)
+    rebuilt = SCRIPT._aggregate_completed_jobs(
+        jobs,
+        judgements,
+        num_judgements=2,
+        aggregate_scores=lambda scores: sum(scores) / len(scores),
+    )
+    self.assertEqual(rebuilt, records)
     document_urls = {}
-    for record in records.values():
-      key = (record["language_pair"], record["document_id"])
-      document_urls.setdefault(key, set()).add(record["vllm_base_url"])
+    for judgement in judgements.values():
+      key = (judgement["language_pair"], judgement["document_id"])
+      document_urls.setdefault(key, set()).add(judgement["vllm_base_url"])
       self.assertEqual(
-          record["vllm_base_url"], base_urls[assignments[key]]
+          judgement["vllm_base_url"], base_urls[assignments[key]]
       )
     self.assertTrue(all(len(urls) == 1 for urls in document_urls.values()))
 
@@ -294,7 +331,12 @@ class DispatchTest(unittest.TestCase):
         {"en-de": _fake_eval_set()}, exclude_human_systems=True
     )[0]
     assignments = {SCRIPT._document_key(job): 0}
-    segment_seed = SCRIPT._stable_seed(0, job.key)
+    judgement_seeds = [
+        SCRIPT._stable_seed(
+            job.key, base_seed=0, judgement_index=index
+        )
+        for index in range(3)
+    ]
 
     class Result:
 
@@ -316,7 +358,7 @@ class DispatchTest(unittest.TestCase):
 
       def score_segment(self, seed, **unused):
         self.calls.append(seed)
-        if seed == segment_seed + 1 and self.calls.count(seed) == 1:
+        if seed == judgement_seeds[1] and self.calls.count(seed) == 1:
           raise RuntimeError("one transient failure")
         return Result(float(seed))
 
@@ -339,16 +381,15 @@ class DispatchTest(unittest.TestCase):
           retry_backoff=0,
           progress_every=3,
           aggregate_scores=lambda scores: sum(scores) / len(scores),
-          remove_outliers=list,
       )
     self.assertEqual(failures, 0)
     self.assertEqual(len(records), 1)
     self.assertEqual(len(judgements), 3)
     self.assertEqual(scorer.calls, [
-        segment_seed,
-        segment_seed + 1,
-        segment_seed + 1,
-        segment_seed + 2,
+        judgement_seeds[0],
+        judgement_seeds[1],
+        judgement_seeds[1],
+        judgement_seeds[2],
     ])
 
   def test_resume_submits_only_missing_judgement(self):
@@ -356,7 +397,12 @@ class DispatchTest(unittest.TestCase):
         {"en-de": _fake_eval_set()}, exclude_human_systems=True
     )[0]
     assignments = {SCRIPT._document_key(job): 0}
-    segment_seed = SCRIPT._stable_seed(0, job.key)
+    judgement_seeds = [
+        SCRIPT._stable_seed(
+            job.key, base_seed=0, judgement_index=index
+        )
+        for index in range(3)
+    ]
 
     class Result:
 
@@ -382,7 +428,7 @@ class DispatchTest(unittest.TestCase):
 
     records = {}
     judgements = {}
-    first = Scorer(fail_seed=segment_seed + 1)
+    first = Scorer(fail_seed=judgement_seeds[1])
     second = Scorer()
     common = {
         "jobs": [job],
@@ -397,7 +443,6 @@ class DispatchTest(unittest.TestCase):
         "retry_backoff": 0,
         "progress_every": 3,
         "aggregate_scores": lambda scores: sum(scores) / len(scores),
-        "remove_outliers": list,
     }
     with tempfile.TemporaryDirectory() as temp_dir:
       common["output_dir"] = Path(temp_dir)
@@ -407,24 +452,62 @@ class DispatchTest(unittest.TestCase):
       self.assertEqual(failures, 1)
       self.assertEqual(len(records), 0)
       self.assertEqual(len(judgements), 2)
+      self.assertFalse((Path(temp_dir) / "errors").exists())
       failures = SCRIPT._run_jobs(
           scorer_factories=(lambda: second,), **common
       )
     self.assertEqual(failures, 0)
     self.assertEqual(len(records), 1)
     self.assertEqual(len(judgements), 3)
-    self.assertEqual(second.calls, [segment_seed + 1])
+    self.assertEqual(second.calls, [judgement_seeds[1]])
 
 
 class PersistenceTest(unittest.TestCase):
 
-  def test_duplicate_raw_record_is_rejected(self):
+  def test_duplicate_judgement_record_is_rejected(self):
     with tempfile.TemporaryDirectory() as temp_dir:
-      path = Path(temp_dir) / "raw.jsonl"
+      path = Path(temp_dir) / "judgements.jsonl"
       line = json.dumps({"key": "same", "score": 0}) + "\n"
       path.write_text(line + line, encoding="utf-8")
       with self.assertRaisesRegex(ValueError, "Duplicate record key"):
         SCRIPT._load_records(path)
+
+  def test_completed_judgements_are_archived_and_loaded(self):
+    records = {
+        "first": {"key": "first", "score": 0.0},
+        "second": {"key": "second", "score": -1.0},
+    }
+    lines = "".join(
+        json.dumps(record) + "\n" for record in records.values()
+    )
+    with tempfile.TemporaryDirectory() as temp_dir:
+      output_dir = Path(temp_dir)
+      path = SCRIPT._judgement_path(output_dir, "en-de")
+      path.parent.mkdir(parents=True)
+      path.write_text(lines, encoding="utf-8")
+      archive_path = SCRIPT._archive_judgements(output_dir, "en-de")
+      self.assertFalse(path.exists())
+      self.assertTrue(archive_path.exists())
+      self.assertEqual(
+          SCRIPT._load_judgements(output_dir, "en-de"), records
+      )
+
+  def test_archive_loader_tolerates_identical_loose_copy(self):
+    record = {"key": "same", "score": 0.0}
+    line = json.dumps(record) + "\n"
+    with tempfile.TemporaryDirectory() as temp_dir:
+      output_dir = Path(temp_dir)
+      path = SCRIPT._judgement_path(output_dir, "en-de")
+      path.parent.mkdir(parents=True)
+      path.write_text(line, encoding="utf-8")
+      SCRIPT._archive_judgements(output_dir, "en-de")
+      # This represents interruption after the atomic archive installation but
+      # before removal of the source JSONL.
+      path.write_text(line, encoding="utf-8")
+      self.assertEqual(
+          SCRIPT._load_judgements(output_dir, "en-de"),
+          {"same": record},
+      )
 
   def test_manifest_rejects_configuration_change(self):
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -469,42 +552,21 @@ class PersistenceTest(unittest.TestCase):
           "dataset_sha256": "same-dataset",
       })
 
-  def test_complete_records_export_aggregate_and_runs(self):
+  def test_complete_language_pair_is_detected(self):
     eval_set = _fake_eval_set()
     records = {}
-    for system_index, system in enumerate(sorted(eval_set.sys_outputs)):
+    for system in sorted(eval_set.sys_outputs):
       for segment_index in range(len(eval_set.src)):
-        score = -(system_index * 10 + segment_index)
-        record = _record(
-            "en-de", system, segment_index, score, [score, score - 1]
-        )
-        records[record["key"]] = record
-    with tempfile.TemporaryDirectory() as temp_dir:
-      output_dir = Path(temp_dir)
-      complete = SCRIPT._export_language_pair(
-          output_dir, "en-de", eval_set, records, num_judgements=2
-      )
-      self.assertTrue(complete)
-      score_dir = (
-          output_dir / "mtme" / "wmt23" / "metric-scores" / "en-de"
-      )
-      aggregate = (score_dir / SCRIPT.AGGREGATE_METRIC).read_text().splitlines()
-      run_one = (
-          score_dir / "GEMBA-MQM-V2-run01-src.seg.score"
-      ).read_text().splitlines()
-      self.assertEqual(len(aggregate), 6)
-      self.assertEqual(len(run_one), 6)
-      self.assertTrue(aggregate[0].startswith("refA\t"))
-      self.assertTrue(aggregate[-1].startswith("system\t"))
+        key = SCRIPT._record_key("en-de", system, segment_index)
+        records[key] = {"key": key}
+    self.assertTrue(
+        SCRIPT._language_pair_complete("en-de", eval_set, records)
+    )
 
-  def test_incomplete_records_do_not_export(self):
-    with tempfile.TemporaryDirectory() as temp_dir:
-      output_dir = Path(temp_dir)
-      complete = SCRIPT._export_language_pair(
-          output_dir, "en-de", _fake_eval_set(), {}, num_judgements=2
-      )
-      self.assertFalse(complete)
-      self.assertFalse((output_dir / "mtme").exists())
+  def test_incomplete_language_pair_is_detected(self):
+    self.assertFalse(
+        SCRIPT._language_pair_complete("en-de", _fake_eval_set(), {})
+    )
 
 
 if __name__ == "__main__":

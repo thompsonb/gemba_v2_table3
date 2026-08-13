@@ -6,10 +6,10 @@ aligned source/hypothesis segment, while the system prompt contains the full
 newline-joined source document. MTME's document maps provide the authoritative
 document boundaries.
 
-Successful individual judgments and completed segment records are appended to
-resumable JSONL files. Once every MTME system for a language pair has been
-scored, aggregate and per-judgment ``*.seg.score`` files are exported under
-``OUTPUT/mtme/wmt23/metric-scores``.
+Successful individual judgments are appended to resumable JSONL files.
+Completed segment aggregates are rebuilt from those judgments in memory when
+needed. Once every MTME system for a language pair has been scored, its
+judgment JSONL is compressed into a verified ZIP archive.
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ from concurrent import futures
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
+import io
 import importlib.metadata
 import json
 import math
@@ -31,6 +32,7 @@ from typing import Any, Callable, Mapping, Sequence
 from urllib import error as urlerror
 from urllib import parse as urlparse
 from urllib import request as urlrequest
+import zipfile
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -45,8 +47,7 @@ DEFAULT_NUM_JUDGEMENTS = 10
 DEFAULT_TEMPERATURE = 0.4
 DEFAULT_MAX_TOKENS = 4096
 DEFAULT_BASE_URL = "http://127.0.0.1:8000/v1"
-SCHEMA_VERSION = 1
-AGGREGATE_METRIC = "GEMBA-MQM-V2-src.seg.score"
+SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -108,7 +109,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
       "--output-dir",
       type=Path,
       default=Path("gemba-v2-scores"),
-      help="Resumable raw records and MTME exports (default: gemba-v2-scores)",
+      help="Resumable judgments and manifest (default: gemba-v2-scores)",
   )
   parser.add_argument(
       "--model",
@@ -153,7 +154,8 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
       action="store_true",
       help=(
           "Skip reference/human systems. This reduces work for Table 3, but "
-          "complete MTME score files cannot be exported until they are scored."
+          "a complete in-memory MTME metric cannot be constructed until they "
+          "are scored."
       ),
   )
   parser.add_argument(
@@ -234,11 +236,6 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
       "--dry-run",
       action="store_true",
       help="Validate alignment and report work/context sizes without scoring",
-  )
-  parser.add_argument(
-      "--export-only",
-      action="store_true",
-      help="Do not score; validate raw records and write any complete MTME files",
   )
   return parser.parse_args(argv)
 
@@ -430,9 +427,16 @@ def _assign_document_endpoints(
   return assignments, endpoint_loads
 
 
-def _stable_seed(base_seed: int, key: str) -> int:
-  digest = hashlib.sha256(key.encode("utf-8")).digest()
-  return (base_seed + int.from_bytes(digest[:4], "big")) % (2**31)
+def _stable_seed(
+    segment_key: str, base_seed: int, judgement_index: int
+) -> int:
+  identity = json.dumps(
+      [segment_key, base_seed, judgement_index],
+      ensure_ascii=False,
+      separators=(",", ":"),
+  )
+  digest = hashlib.sha256(identity.encode("utf-8")).digest()
+  return int.from_bytes(digest[:4], "big") % (2**31)
 
 
 def _prompt_character_count(
@@ -693,7 +697,7 @@ def _ensure_manifest(output_dir: Path, configuration: dict[str, Any]) -> Path:
     comparable_current = dict(configuration)
     # Paths and endpoints are runtime infrastructure, not scoring parameters.
     # Dataset identity is enforced by dataset_sha256, so relocating the same
-    # curated files must not prevent a resume. Each raw record retains the URL
+    # curated files must not prevent a resume. Each judgment retains the URL
     # that handled it for auditing.
     comparable_recorded.pop("data_root", None)
     comparable_current.pop("data_root", None)
@@ -722,41 +726,115 @@ def _ensure_manifest(output_dir: Path, configuration: dict[str, Any]) -> Path:
   return manifest_path
 
 
-def _raw_path(output_dir: Path, language_pair: str) -> Path:
-  return output_dir / "raw" / f"{language_pair}.jsonl"
-
-
-def _error_path(output_dir: Path, language_pair: str) -> Path:
-  return output_dir / "errors" / f"{language_pair}.jsonl"
-
-
 def _judgement_path(output_dir: Path, language_pair: str) -> Path:
   return output_dir / "judgements" / f"{language_pair}.jsonl"
+
+
+def _judgement_archive_path(output_dir: Path, language_pair: str) -> Path:
+  return output_dir / "judgements" / f"{language_pair}.jsonl.zip"
 
 
 def _judgement_key(segment_key: str, judgement_index: int) -> str:
   return f"{segment_key}\t{judgement_index}"
 
 
-def _load_records(path: Path) -> dict[str, dict[str, Any]]:
+def _read_records(
+    file: Any, source: str
+) -> dict[str, dict[str, Any]]:
   records = {}
-  if not path.exists():
-    return records
-  with path.open(encoding="utf-8") as file:
-    for line_number, line in enumerate(file, 1):
-      if not line.strip():
-        continue
-      try:
-        record = json.loads(line)
-      except json.JSONDecodeError as error:
-        raise ValueError(f"Invalid JSON at {path}:{line_number}") from error
-      key = record.get("key")
-      if not isinstance(key, str):
-        raise ValueError(f"Missing record key at {path}:{line_number}")
-      if key in records:
-        raise ValueError(f"Duplicate record key {key!r} in {path}")
-      records[key] = record
+  for line_number, line in enumerate(file, 1):
+    if not line.strip():
+      continue
+    try:
+      record = json.loads(line)
+    except json.JSONDecodeError as error:
+      raise ValueError(f"Invalid JSON at {source}:{line_number}") from error
+    key = record.get("key")
+    if not isinstance(key, str):
+      raise ValueError(f"Missing record key at {source}:{line_number}")
+    if key in records:
+      raise ValueError(f"Duplicate record key {key!r} in {source}")
+    records[key] = record
   return records
+
+
+def _load_records(path: Path) -> dict[str, dict[str, Any]]:
+  if not path.exists():
+    return {}
+  with path.open(encoding="utf-8") as file:
+    return _read_records(file, str(path))
+
+
+def _load_judgements(
+    output_dir: Path, language_pair: str
+) -> dict[str, dict[str, Any]]:
+  path = _judgement_path(output_dir, language_pair)
+  archive_path = _judgement_archive_path(output_dir, language_pair)
+  records = {}
+  if archive_path.exists():
+    try:
+      with zipfile.ZipFile(archive_path) as archive:
+        if archive.namelist() != [path.name]:
+          raise ValueError(
+              f"Expected only {path.name!r} in {archive_path}"
+          )
+        with archive.open(path.name) as binary_file:
+          with io.TextIOWrapper(binary_file, encoding="utf-8") as file:
+            records = _read_records(
+                file, f"{archive_path}!{path.name}"
+            )
+    except zipfile.BadZipFile as error:
+      raise ValueError(f"Invalid ZIP archive: {archive_path}") from error
+
+  loose_records = _load_records(path)
+  for key, record in loose_records.items():
+    if key in records and records[key] != record:
+      raise ValueError(
+          f"Conflicting judgment record {key!r} in {path} and {archive_path}"
+      )
+    records[key] = record
+  return records
+
+
+def _archive_judgements(output_dir: Path, language_pair: str) -> Path:
+  path = _judgement_path(output_dir, language_pair)
+  archive_path = _judgement_archive_path(output_dir, language_pair)
+  if not path.exists():
+    if archive_path.exists():
+      return archive_path
+    raise ValueError(f"Missing completed judgments for {language_pair}: {path}")
+
+  temporary = archive_path.with_name(
+      f".{archive_path.name}.{os.getpid()}.tmp"
+  )
+  try:
+    with zipfile.ZipFile(
+        temporary,
+        mode="w",
+        compression=zipfile.ZIP_DEFLATED,
+        compresslevel=9,
+        allowZip64=True,
+    ) as archive:
+      archive.write(path, arcname=path.name)
+    with zipfile.ZipFile(temporary) as archive:
+      failed_member = archive.testzip()
+      if failed_member is not None:
+        raise ValueError(
+            f"CRC verification failed for {failed_member!r} in {temporary}"
+        )
+    os.replace(temporary, archive_path)
+    original_size = path.stat().st_size
+    archived_size = archive_path.stat().st_size
+    path.unlink()
+  except BaseException:
+    temporary.unlink(missing_ok=True)
+    raise
+
+  _progress(
+      f"[archive] {language_pair}: {original_size / 2**20:.1f} MiB -> "
+      f"{archived_size / 2**20:.1f} MiB at {archive_path}"
+  )
+  return archive_path
 
 
 class _ThreadScorers:
@@ -780,8 +858,11 @@ def _score_judgement(
     retries: int,
     retry_backoff: float,
 ) -> dict[str, Any]:
-  segment_seed = _stable_seed(base_seed, job.key)
-  seed = segment_seed + judgement_index
+  seed = _stable_seed(
+      job.key,
+      base_seed=base_seed,
+      judgement_index=judgement_index,
+  )
   for attempt in range(retries + 1):
     try:
       result = scorers.get().score_segment(
@@ -848,9 +929,7 @@ def _aggregate_job(
     job: ScoreJob,
     judgement_records: Mapping[int, dict[str, Any]],
     num_judgements: int,
-    base_seed: int,
     aggregate_scores: Callable[[Sequence[float]], float],
-    remove_outliers: Callable[[Sequence[float]], Sequence[float]],
 ) -> dict[str, Any]:
   if set(judgement_records) != set(range(num_judgements)):
     raise ValueError(f"Cannot aggregate incomplete judgements for {job.key}")
@@ -860,33 +939,37 @@ def _aggregate_job(
     _validate_judgement_record(record, job.key, index)
     ordered.append(record)
   run_scores = [float(record["score"]) for record in ordered]
-  filtered_scores = list(remove_outliers(run_scores))
-  endpoint_urls = sorted({
-      str(record["vllm_base_url"])
-      for record in ordered
-      if record.get("vllm_base_url")
-  })
   return {
       "key": job.key,
-      "language_pair": job.language_pair,
-      "system": job.system,
-      "document_id": job.document_id,
-      "document_index": job.document_index,
-      "document_segment_index": job.document_segment_index,
-      "global_segment_index": job.global_segment_index,
-      "source_language": job.source_language,
-      "target_language": job.target_language,
-      "seed": _stable_seed(base_seed, job.key),
-      "vllm_base_url": endpoint_urls[0] if len(endpoint_urls) == 1 else None,
-      "vllm_base_urls": endpoint_urls,
-      "completed_at": datetime.now(timezone.utc).isoformat(),
-      "source": job.source,
-      "target": job.target,
       "score": float(aggregate_scores(run_scores)),
       "run_scores": run_scores,
-      "filtered_run_scores": filtered_scores,
-      "annotations": [record["annotation"] for record in ordered],
   }
+
+
+def _aggregate_completed_jobs(
+    jobs: Sequence[ScoreJob],
+    judgements: Mapping[str, dict[str, Any]],
+    num_judgements: int,
+    aggregate_scores: Callable[[Sequence[float]], float],
+) -> dict[str, dict[str, Any]]:
+  records = {}
+  for job in jobs:
+    job_judgements = {}
+    for judgement_index in range(num_judgements):
+      key = _judgement_key(job.key, judgement_index)
+      if key not in judgements:
+        continue
+      record = judgements[key]
+      _validate_judgement_record(record, job.key, judgement_index)
+      job_judgements[judgement_index] = record
+    if len(job_judgements) == num_judgements:
+      records[job.key] = _aggregate_job(
+          job,
+          job_judgements,
+          num_judgements,
+          aggregate_scores,
+      )
+  return records
 
 
 def _write_json_line(file: Any, record: dict[str, Any]) -> None:
@@ -910,30 +993,16 @@ def _run_jobs(
     retry_backoff: float,
     progress_every: int,
     aggregate_scores: Callable[[Sequence[float]], float],
-    remove_outliers: Callable[[Sequence[float]], Sequence[float]],
 ) -> int:
   if not jobs:
     return 0
-  (output_dir / "raw").mkdir(parents=True, exist_ok=True)
-  (output_dir / "errors").mkdir(parents=True, exist_ok=True)
   (output_dir / "judgements").mkdir(parents=True, exist_ok=True)
-  raw_files = {
-      language_pair: _raw_path(output_dir, language_pair).open(
-          "a", encoding="utf-8"
-      )
-      for language_pair in sorted({job.language_pair for job in jobs})
-  }
-  error_files = {
-      language_pair: _error_path(output_dir, language_pair).open(
-          "a", encoding="utf-8"
-      )
-      for language_pair in raw_files
-  }
+  language_pairs = sorted({job.language_pair for job in jobs})
   judgement_files = {
       language_pair: _judgement_path(output_dir, language_pair).open(
           "a", encoding="utf-8"
       )
-      for language_pair in raw_files
+      for language_pair in language_pairs
   }
   if not scorer_factories:
     raise ValueError("At least one scorer factory is required")
@@ -980,12 +1049,9 @@ def _run_jobs(
         job,
         job_judgements[job.key],
         num_judgements,
-        base_seed,
         aggregate_scores,
-        remove_outliers,
     )
     records[job.key] = record
-    _write_json_line(raw_files[job.language_pair], record)
     segment_succeeded += 1
     return True
 
@@ -1054,13 +1120,6 @@ def _run_jobs(
           judgement = future.result()
         except Exception as error:
           failed += 1
-          _write_json_line(error_files[job.language_pair], {
-              "key": _judgement_key(job.key, judgement_index),
-              "segment_key": job.key,
-              "judgement_index": judgement_index,
-              "failed_at": datetime.now(timezone.utc).isoformat(),
-              "error": str(error),
-          })
           _progress(f"[error] {error}")
         else:
           judgement_succeeded += 1
@@ -1090,47 +1149,15 @@ def _run_jobs(
     for executor in executors:
       executor.shutdown(wait=True)
   finally:
-    for file in (
-        *raw_files.values(),
-        *error_files.values(),
-        *judgement_files.values(),
-    ):
+    for file in judgement_files.values():
       file.close()
   return failed
 
 
-def _atomic_write_lines(path: Path, lines: Sequence[str]) -> None:
-  path.parent.mkdir(parents=True, exist_ok=True)
-  temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-  temporary.write_text("".join(lines), encoding="utf-8")
-  os.replace(temporary, path)
-
-
-def _validate_score_record(
-    record: dict[str, Any], num_judgements: int, key: str
-) -> None:
-  score = record.get("score")
-  run_scores = record.get("run_scores")
-  if not isinstance(score, (int, float)) or not math.isfinite(score):
-    raise ValueError(f"Record {key!r} has an invalid aggregate score")
-  if not isinstance(run_scores, list) or len(run_scores) != num_judgements:
-    raise ValueError(
-        f"Record {key!r} has {len(run_scores) if isinstance(run_scores, list) else 'invalid'} "
-        f"run scores; expected {num_judgements}"
-    )
-  if not all(
-      isinstance(score, (int, float)) and math.isfinite(score)
-      for score in run_scores
-  ):
-    raise ValueError(f"Record {key!r} has invalid run scores")
-
-
-def _export_language_pair(
-    output_dir: Path,
+def _language_pair_complete(
     language_pair: str,
     eval_set: Any,
-    records: dict[str, dict[str, Any]],
-    num_judgements: int,
+    records: Mapping[str, dict[str, Any]],
 ) -> bool:
   required_keys = [
       _record_key(language_pair, system, segment_index)
@@ -1140,43 +1167,16 @@ def _export_language_pair(
   missing = [key for key in required_keys if key not in records]
   if missing:
     _progress(
-        f"[export] {language_pair}: incomplete ({len(required_keys) - len(missing)}/"
-        f"{len(required_keys)} segments); MTME files not written"
+        f"[status] {language_pair}: incomplete "
+        f"({len(required_keys) - len(missing)}/{len(required_keys)} segments)"
     )
     return False
-  for key in required_keys:
-    _validate_score_record(records[key], num_judgements, key)
-
-  score_dir = (
-      output_dir / "mtme" / "wmt23" / "metric-scores" / language_pair
-  )
-  aggregate_lines = []
-  run_lines = [[] for _ in range(num_judgements)]
-  for system in sorted(eval_set.sys_outputs):
-    for segment_index in range(len(eval_set.src)):
-      record = records[_record_key(language_pair, system, segment_index)]
-      aggregate_lines.append(f"{system}\t{record['score']:.17g}\n")
-      for run_index, run_score in enumerate(record["run_scores"]):
-        run_lines[run_index].append(f"{system}\t{run_score:.17g}\n")
-
-  _atomic_write_lines(score_dir / AGGREGATE_METRIC, aggregate_lines)
-  for run_index, lines in enumerate(run_lines, 1):
-    _atomic_write_lines(
-        score_dir / f"GEMBA-MQM-V2-run{run_index:02d}-src.seg.score",
-        lines,
-    )
-  _progress(
-      f"[export] {language_pair}: wrote aggregate and {num_judgements} "
-      f"individual-run MTME score files to {score_dir}"
-  )
+  _progress(f"[status] {language_pair}: complete ({len(required_keys)} segments)")
   return True
 
 
 def main(argv: Sequence[str] | None = None) -> int:
   args = _parse_args(argv)
-  if args.dry_run and args.export_only:
-    _progress("error: --dry-run and --export-only cannot be combined")
-    return 2
   try:
     (
         GembaV2,
@@ -1245,7 +1245,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     configuration = _configuration(
         args, data_root, gemba_prompt, gemba_scoring
     )
-    if not args.export_only and args.context_preflight != "none":
+    if args.context_preflight != "none":
       maximum_tokens, maximum_token_job, model_limit = (
           _run_context_preflight(
               jobs,
@@ -1270,90 +1270,87 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     manifest_path = _ensure_manifest(output_dir, configuration)
     _progress(f"[setup] manifest: {manifest_path}")
-    records = {}
     judgements = {}
     for language_pair in language_pairs:
-      records.update(_load_records(_raw_path(output_dir, language_pair)))
-      judgements.update(_load_records(
-          _judgement_path(output_dir, language_pair)
-      ))
-    _progress(f"[resume] loaded {len(records)} completed segment records")
-    _progress(f"[resume] loaded {len(judgements)} partial judgments")
+      judgements.update(_load_judgements(output_dir, language_pair))
+    records = _aggregate_completed_jobs(
+        jobs,
+        judgements,
+        args.num_judgements,
+        gemba_scoring.aggregate_scores,
+    )
+    _progress(f"[resume] loaded {len(judgements)} saved judgments")
+    _progress(f"[resume] rebuilt {len(records)} completed segment aggregates")
 
-    if not args.export_only:
-      pending_jobs = [job for job in jobs if job.key not in records]
-      if args.limit is not None:
-        pending_jobs = pending_jobs[:args.limit]
-      pending_judgements = sum(
-          _judgement_key(job.key, judgement_index) not in judgements
-          for job in pending_jobs
-          for judgement_index in range(args.num_judgements)
-      )
-      _progress(
-          f"[start] {len(pending_jobs)} pending segments; "
-          f"{pending_judgements} pending judgments; "
-          f"endpoints={len(base_urls)}; n={args.num_judgements}; "
-          f"max-inflight-judgements="
-          f"{args.max_inflight_judgements}/endpoint; "
-          "one judgment/request; "
-          f"maximum concurrency="
-          f"{args.max_inflight_judgements * len(base_urls)} judgments; "
-          f"retries={args.retries}"
-      )
-      scorer_factories = [
-          lambda base_url=base_url: GembaV2(
-              model=args.model,
-              base_url=base_url,
-              num_judgements=1,
-              temperature=args.temperature,
-              max_tokens=args.max_tokens,
-              cache_salt=args.cache_salt,
-          )
-          for base_url in base_urls
-      ]
+    pending_jobs = [job for job in jobs if job.key not in records]
+    if args.limit is not None:
+      pending_jobs = pending_jobs[:args.limit]
+    pending_judgements = sum(
+        _judgement_key(job.key, judgement_index) not in judgements
+        for job in pending_jobs
+        for judgement_index in range(args.num_judgements)
+    )
+    _progress(
+        f"[start] {len(pending_jobs)} pending segments; "
+        f"{pending_judgements} pending judgments; "
+        f"endpoints={len(base_urls)}; n={args.num_judgements}; "
+        f"max-inflight-judgements="
+        f"{args.max_inflight_judgements}/endpoint; "
+        "one judgment/request; "
+        f"maximum concurrency="
+        f"{args.max_inflight_judgements * len(base_urls)} judgments; "
+        f"retries={args.retries}"
+    )
+    scorer_factories = [
+        lambda base_url=base_url: GembaV2(
+            model=args.model,
+            base_url=base_url,
+            num_judgements=1,
+            temperature=args.temperature,
+            max_tokens=args.max_tokens,
+            cache_salt=args.cache_salt,
+        )
+        for base_url in base_urls
+    ]
 
-      failures = _run_jobs(
-          pending_jobs,
-          scorer_factories,
-          base_urls,
-          document_endpoints,
-          records,
-          judgements,
-          output_dir,
-          args.num_judgements,
-          args.max_inflight_judgements,
-          args.seed,
-          args.retries,
-          args.retry_backoff,
-          args.progress_every,
-          gemba_scoring.aggregate_scores,
-          gemba_scoring.remove_outliers,
-      )
-    else:
-      failures = 0
+    failures = _run_jobs(
+        pending_jobs,
+        scorer_factories,
+        base_urls,
+        document_endpoints,
+        records,
+        judgements,
+        output_dir,
+        args.num_judgements,
+        args.max_inflight_judgements,
+        args.seed,
+        args.retries,
+        args.retry_backoff,
+        args.progress_every,
+        gemba_scoring.aggregate_scores,
+    )
 
-    exports = [
-        _export_language_pair(
-            output_dir,
+    completions = [
+        _language_pair_complete(
             language_pair,
             eval_sets[language_pair],
             records,
-            args.num_judgements,
         )
         for language_pair in language_pairs
     ]
+    for language_pair, complete in zip(language_pairs, completions):
+      if complete:
+        _archive_judgements(output_dir, language_pair)
     if failures:
       _progress(
           f"[incomplete] {failures} judgments failed; rerun the same command "
           "to retry only unfinished judgments"
       )
       return 1
-    if args.export_only and not all(exports):
-      return 1
     _progress("[complete] scoring pass finished")
     return 0
   except KeyboardInterrupt:
-    _progress("[stopped] interrupted; completed JSONL records are resumable")
+    _progress("[stopped] interrupted; saved judgments are resumable")
     return 130
   except (OSError, RuntimeError, ValueError) as error:
     _progress(f"error: {error}")
