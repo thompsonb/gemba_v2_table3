@@ -1,0 +1,24 @@
+mkdir -p ../runs
+
+nohup uv run --frozen --group serve vllm serve \
+  Qwen/Qwen3.5-122B-A10B-FP8 \
+  --port 8000 \
+  --generation-config vllm \
+  --max-model-len 32768 \
+  --language-model-only \
+  --enable-prefix-caching \
+  --default-chat-template-kwargs '{"enable_thinking": false}' \
+  --max-num-seqs 1024 \
+  --max-num-batched-tokens 16384 \
+  > vllm-qwen35-122b-a10b-fp8.log 2>&1 &
+
+nohup uv run --frozen python ../scripts/score_wmt23_gemba_v2.py \
+  --model Qwen/Qwen3.5-122B-A10B-FP8 \
+  --base-url http://127.0.0.1:8000/v1 \
+  --num-judgements 10 \
+  --temperature 0.4 \
+  --max-tokens 4096 \
+  --seed 0 \
+  --max-inflight-judgements 1024 \
+  --output-dir ../runs/gemba-v2-all-qwen35-122b-a10b-fp8-t04-n10-4k \
+  > ../runs/gemba-v2-all-qwen35-122b-a10b-fp8-t04-n10-4k.log 2>&1 &

@@ -8,6 +8,12 @@ dependencies = [
   "mt-metrics-eval",
 ]
 
+[dependency-groups]
+serve = [
+  "transformers==5.8.0",
+  "vllm==0.27.1",
+]
+
 [tool.uv]
 package = false
 

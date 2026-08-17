@@ -7,8 +7,8 @@ individual-run result, because those scores are not part of that bundle.
 It also excludes human-system outputs, matching the population used for the
 published Table 3 values.
 
-Locally generated GEMBA-MQM V2 scores can be added directly from a scorer
-output directory with ``--gemba-output-dir OUTPUT``.
+Locally generated GEMBA-MQM V2 scores can be added directly from one or more
+scorer output directories by repeating ``--gemba-output-dir OUTPUT``.
 
 No expected paper values are embedded in the script. The calculations use the
 repository's WMT24-on-WMT23 task definition:
@@ -132,10 +132,13 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
   )
   parser.add_argument(
       "--gemba-output-dir",
+      dest="gemba_output_dirs",
       type=Path,
+      action="append",
+      default=[],
       help=(
-          "Output directory produced by score_wmt23_gemba_v2.py; saved "
-          "judgments are aggregated in memory and added as GEMBA-MQM V2"
+          "Output directory produced by score_wmt23_gemba_v2.py; repeat the "
+          "option to add multiple GEMBA-MQM V2 rows"
       ),
   )
   parser.add_argument(
@@ -272,12 +275,14 @@ def _validate_gemba_dataset(
     )
 
 
-def _gemba_metric_name(model: str) -> tuple[str, str]:
+def _gemba_metric_name(
+    model: str, num_judgements: int
+) -> tuple[str, str]:
   model_name = model.strip().rstrip("/").rsplit("/", 1)[-1].lower()
   model_slug = re.sub(r"[^a-z0-9.]+", "-", model_name).strip("-")
   if not model_slug:
     raise ValueError(f"Cannot derive a metric name from model {model!r}")
-  basename = f"gemba-v2-{model_slug}-rrwa"
+  basename = f"gemba-v2-{model_slug}-rrwa(n={num_judgements})"
   return basename, f"{basename}[noref]"
 
 
@@ -422,10 +427,15 @@ def _add_gemba_scores(
   )
   num_judgements = configuration["num_judgements"]
   metric_basename, metric_display_name = _gemba_metric_name(
-      configuration["model"]
+      configuration["model"], num_judgements
   )
   for language_pair in LANGUAGE_PAIRS:
     records = _load_judgements(output_dir, language_pair)
+    if not records and allow_incomplete:
+      _progress(
+          f"[gemba] {language_pair}: no judgments; metric values unavailable"
+      )
+      continue
     eval_set = eval_sets[("wmt23", language_pair)]
     scores, judgment_count_histogram = _aggregate_gemba_records(
         eval_set,
@@ -523,13 +533,20 @@ def _metric_display_info(
 
 def _point_estimate_table(
     metrics: Sequence[str],
-    average_column: dict[str, tuple[float, int]],
+    average_column: dict[str, tuple[float | None, int | None]],
     task_columns: Sequence[dict[str, tuple[float, int]]],
     column_headers: Sequence[Sequence[str]],
     output_format: str,
     baselines_metainfo: Any,
+    separator_after_metric: str | None = None,
 ) -> str:
   """Format point estimates while omitting unavailable cluster ranks."""
+
+  def FormatScore(
+      column: dict[str, tuple[float, int]], metric: str, spec: str
+  ) -> str:
+    value = column.get(metric)
+    return "-" if value is None else format(value[0], spec)
 
   def TextMetric(metric: str) -> str:
     basename, noref, baseline, contrastive = _metric_display_info(
@@ -551,10 +568,12 @@ def _point_estimate_table(
       average, rank = average_column[metric]
       rows.append([
           TextMetric(metric),
-          str(rank),
-          f"{average:f}",
-          *(f"{column[metric][0]:f}" for column in task_columns),
+          "-" if rank is None else str(rank),
+          "-" if average is None else f"{average:f}",
+          *(FormatScore(column, metric, "f") for column in task_columns),
       ])
+      if metric == separator_after_metric:
+        rows.append(["-----"] * len(rows[-1]))
     return "".join("\t".join(row) + "\n" for row in rows)
 
   if output_format == "latex":
@@ -583,9 +602,17 @@ def _point_estimate_table(
     lines.append("\\midrule")
     for metric in metrics:
       average, rank = average_column[metric]
-      cells = [LatexMetric(metric), str(rank), f"{average:.3f}"]
-      cells.extend(f"{column[metric][0]:.3f}" for column in task_columns)
+      cells = [
+          LatexMetric(metric),
+          "-" if rank is None else str(rank),
+          "-" if average is None else f"{average:.3f}",
+      ]
+      cells.extend(
+          FormatScore(column, metric, ".3f") for column in task_columns
+      )
       lines.append(" & ".join(cells) + " \\\\")
+      if metric == separator_after_metric:
+        lines.append("\\midrule")
     lines.extend(("\\bottomrule", "\\end{tabular}"))
     return "\n".join(lines) + "\n"
 
@@ -594,8 +621,8 @@ def _point_estimate_table(
     average, rank = average_column[metric]
     rows.append([
         TextMetric(metric),
-        f"{rank}{average:6.3f}",
-        *(f"{column[metric][0]:6.3f}" for column in task_columns),
+        "-" if average is None else f"{rank}{average:6.3f}",
+        *(FormatScore(column, metric, "6.3f") for column in task_columns),
     ])
   widths = [
       max(len(row[index]) for row in [*column_headers, *rows])
@@ -608,11 +635,13 @@ def _point_estimate_table(
         for index, value in enumerate(header)
     ))
   lines.append("  ".join("-" * width for width in widths))
-  for row in rows:
+  for metric, row in zip(metrics, rows):
     lines.append("  ".join(
         value.ljust(widths[index]) if index == 0 else value.rjust(widths[index])
         for index, value in enumerate(row)
     ))
+    if metric == separator_after_metric:
+      lines.append("  ".join("-" * width for width in widths))
   return "\n".join(lines) + "\n"
 
 
@@ -623,31 +652,50 @@ def _build_table(
     weights: Sequence[float],
     permutations: int,
     output_format: str,
-    local_gemba_metric: str | None = None,
+    local_gemba_metrics: Sequence[str] = (),
 ) -> str:
+  local_gemba_metrics = tuple(local_gemba_metrics)
+  if len(set(local_gemba_metrics)) != len(local_gemba_metrics):
+    raise ValueError("Duplicate local GEMBA metric names")
   average_scores = dict(results.AverageCorrs(weights))
   requested_metrics = list(TABLE3_METRICS)
-  if local_gemba_metric:
-    requested_metrics.extend((
-        PUBLISHED_GEMBA_V2_METRIC,
-        local_gemba_metric,
-    ))
+  if local_gemba_metrics:
+    requested_metrics.extend((PUBLISHED_GEMBA_V2_METRIC, *local_gemba_metrics))
     average_scores[PUBLISHED_GEMBA_V2_METRIC] = (
         PUBLISHED_GEMBA_V2_AVERAGE
     )
-  missing = [metric for metric in requested_metrics if metric not in average_scores]
+  local_gemba_metric_set = set(local_gemba_metrics)
+  missing = [
+      metric for metric in requested_metrics
+      if metric not in average_scores and metric not in local_gemba_metric_set
+  ]
   if missing:
     raise ValueError(
         "MTME data is missing Table 3 metrics: " + ", ".join(missing)
     )
   paper_order = {metric: index for index, metric in enumerate(requested_metrics)}
-  metrics = sorted(
+  ranked_metrics = sorted(
       requested_metrics,
-      key=lambda metric: (-average_scores[metric], paper_order[metric]),
+      key=lambda metric: (
+          metric not in average_scores,
+          -average_scores.get(metric, 0.0),
+          paper_order[metric],
+      ),
   )
   average_column = _ordinal_scores({
-      metric: average_scores[metric] for metric in metrics
+      metric: average_scores[metric]
+      for metric in ranked_metrics
+      if metric in average_scores
   })
+  for metric in local_gemba_metrics:
+    if metric not in average_scores:
+      average_column[metric] = (None, None)
+  local_metric_block = [
+      metric for metric in ranked_metrics if metric in local_gemba_metric_set
+  ]
+  metrics = local_metric_block + [
+      metric for metric in ranked_metrics if metric not in local_gemba_metric_set
+  ]
 
   language_header = ["", ""] + [
       result.attr_vals["lang"] for result in results.results
@@ -663,7 +711,7 @@ def _build_table(
     statistic_header.append(f"{level} ({statistic})")
 
   task_columns = [dict(result.corr_ranks) for result in results.results]
-  if local_gemba_metric:
+  if local_gemba_metrics:
     if len(task_columns) != len(PUBLISHED_GEMBA_V2_TASK_RESULTS):
       raise ValueError(
           "Published GEMBA V2 row does not match the number of table tasks"
@@ -681,6 +729,9 @@ def _build_table(
         headers,
         output_format,
         meta_info_module.WMT23,
+        separator_after_metric=(
+            local_metric_block[-1] if local_metric_block else None
+        ),
     )
   return tasks_module.MetricsTable(
       metrics=metrics,
@@ -696,9 +747,25 @@ def main(argv: Sequence[str] | None = None) -> int:
   args = _parse_args(argv)
   try:
     data_root = _resolve_data_root(args.data_dir)
-    gemba_output_dir = _resolve_gemba_output_dir(args.gemba_output_dir)
+    gemba_output_dirs = [
+        _resolve_gemba_output_dir(path) for path in args.gemba_output_dirs
+    ]
+    expected_local_gemba_metrics = []
+    local_metric_origins = {}
+    for output_dir in gemba_output_dirs:
+      configuration = _gemba_configuration(output_dir)
+      _, metric = _gemba_metric_name(
+          configuration["model"], configuration["num_judgements"]
+      )
+      if metric in local_metric_origins:
+        raise ValueError(
+            f"Duplicate GEMBA metric name {metric}: "
+            f"{local_metric_origins[metric]} and {output_dir}"
+        )
+      local_metric_origins[metric] = output_dir
+      expected_local_gemba_metrics.append(metric)
     _progress(f"[setup] MTME data: {data_root}")
-    if gemba_output_dir:
+    for gemba_output_dir in gemba_output_dirs:
       _progress(f"[setup] GEMBA judgments: {gemba_output_dir}")
     _progress("[setup] importing mt-metrics-eval")
     (
@@ -710,8 +777,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     ) = _import_mtme()
     _progress("[setup] imports complete")
     eval_sets = _build_eval_sets(data_module, data_root)
-    local_gemba_metric = None
-    if gemba_output_dir:
+    local_gemba_metrics = []
+    for gemba_output_dir, expected_metric in zip(
+        gemba_output_dirs, expected_local_gemba_metrics
+    ):
       local_gemba_metric = _add_gemba_scores(
           eval_sets,
           gemba_output_dir,
@@ -719,6 +788,12 @@ def main(argv: Sequence[str] | None = None) -> int:
           aggregate_scores,
           args.allow_incomplete,
       )
+      if local_gemba_metric != expected_metric:
+        raise RuntimeError(
+            f"Unexpected GEMBA metric name for {gemba_output_dir}: "
+            f"{local_gemba_metric} != {expected_metric}"
+        )
+      local_gemba_metrics.append(local_gemba_metric)
     results, weights = _run_tasks(
         tasks_module,
         numpy_module,
@@ -734,7 +809,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         weights,
         args.permutations,
         args.format,
-        local_gemba_metric=local_gemba_metric,
+        local_gemba_metrics=local_gemba_metrics,
     )
   except KeyboardInterrupt:
     _progress("[stopped] interrupted by user")

@@ -26,8 +26,17 @@ class ArgumentsTest(unittest.TestCase):
     self.assertTrue((args.data_dir / "wmt23_data").is_dir())
     self.assertNotIn("rank_cutoff", vars(args))
     self.assertNotIn("gemba_scores_dir", vars(args))
-    self.assertIsNone(args.gemba_output_dir)
+    self.assertEqual(args.gemba_output_dirs, [])
     self.assertFalse(args.allow_incomplete)
+
+  def test_accepts_multiple_gemba_output_directories(self):
+    args = SCRIPT._parse_args([
+        "--gemba-output-dir", "first",
+        "--gemba-output-dir", "second",
+    ])
+    self.assertEqual(
+        args.gemba_output_dirs, [Path("first"), Path("second")]
+    )
 
   def test_incomplete_gemba_scores_require_explicit_opt_in(self):
     args = SCRIPT._parse_args(["--allow-incomplete"])
@@ -40,15 +49,20 @@ class ArgumentsTest(unittest.TestCase):
     self.assertFalse(any("gemba-v2" in m.lower() for m in SCRIPT.TABLE3_METRICS))
 
   def test_local_gemba_metric_name_comes_from_manifest_model(self):
-    first = SCRIPT._gemba_metric_name("publisher/First Model")
-    second = SCRIPT._gemba_metric_name("publisher/Second Model")
+    first = SCRIPT._gemba_metric_name("publisher/First Model", 3)
+    second = SCRIPT._gemba_metric_name("publisher/Second Model", 10)
     self.assertNotEqual(first, second)
-    for basename, display_name in (first, second):
+    for (basename, display_name), num_judgements in (
+        (first, 3),
+        (second, 10),
+    ):
       self.assertEqual(display_name, f"{basename}[noref]")
       self.assertEqual(basename, basename.lower())
       self.assertNotIn("/", basename)
       self.assertTrue(basename.startswith("gemba-v2-"))
-      self.assertTrue(basename.endswith("-rrwa"))
+      self.assertTrue(
+          basename.endswith(f"-rrwa(n={num_judgements})")
+      )
 
   def test_rejects_negative_permutations(self):
     with self.assertRaises(SystemExit):
@@ -226,6 +240,76 @@ class RankingTest(unittest.TestCase):
         {"a": (0.9, 1), "b": (0.8, 2)},
     )
 
+  def test_multiple_local_metrics_form_score_sorted_top_block(self):
+    local_high = "gemba-v2-first-model-rrwa(n=10)[noref]"
+    local_low = "gemba-v2-second-model-rrwa(n=10)[noref]"
+    scores = {
+        metric: 0.700 - index / 1000
+        for index, metric in enumerate(SCRIPT.TABLE3_METRICS)
+    }
+    scores[local_high] = 0.900
+    scores[local_low] = 0.100
+    task_results = []
+    for language_pair, level, corr_fcn in (
+        ("en-de", "sys", "pce"),
+        ("en-de", "seg", "KendallWithTiesOpt"),
+        ("he-en", "sys", "pce"),
+        ("he-en", "seg", "KendallWithTiesOpt"),
+        ("zh-en", "sys", "pce"),
+        ("zh-en", "seg", "KendallWithTiesOpt"),
+    ):
+      task_results.append(SimpleNamespace(
+          attr_vals={
+              "lang": language_pair,
+              "level": level,
+              "corr_fcn": corr_fcn,
+          },
+          corr_ranks={metric: (score, 1) for metric, score in scores.items()},
+      ))
+    results = SimpleNamespace(
+        AverageCorrs=lambda unused_weights: scores,
+        results=task_results,
+    )
+    table = SCRIPT._build_table(
+        tasks_module=SimpleNamespace(),
+        meta_info_module=SimpleNamespace(
+            WMT23=SimpleNamespace(baseline_metrics=set())
+        ),
+        results=results,
+        weights=[1.0] * 6,
+        permutations=0,
+        output_format="text",
+        local_gemba_metrics=[local_low, local_high],
+    )
+    lines = table.splitlines()
+    high_index = next(
+        index for index, line in enumerate(lines) if line.startswith(local_high)
+    )
+    low_index = next(
+        index for index, line in enumerate(lines) if line.startswith(local_low)
+    )
+    published_index = next(
+        index for index, line in enumerate(lines)
+        if line.startswith(SCRIPT.PUBLISHED_GEMBA_V2_METRIC)
+    )
+    self.assertLess(high_index, low_index)
+    self.assertLess(low_index, published_index)
+    self.assertTrue(lines[low_index + 1].replace("-", "").strip() == "")
+    self.assertIn(" 1 0.900", lines[high_index])
+    self.assertIn("32 0.100", lines[low_index])
+
+  def test_duplicate_local_metric_names_are_rejected(self):
+    with self.assertRaisesRegex(ValueError, "Duplicate local GEMBA"):
+      SCRIPT._build_table(
+          tasks_module=SimpleNamespace(),
+          meta_info_module=SimpleNamespace(),
+          results=SimpleNamespace(),
+          weights=[],
+          permutations=0,
+          output_format="text",
+          local_gemba_metrics=["duplicate", "duplicate"],
+      )
+
 
 class ProtocolTest(unittest.TestCase):
 
@@ -235,21 +319,40 @@ class ProtocolTest(unittest.TestCase):
     self.assertTrue(all(task.human is False for task in task_set))
 
   def test_point_estimate_formats_omit_task_rank(self):
+    missing_cell = {
+        "text": "  -\n", "tsv": "\t-\n", "latex": " & - \\\\\n"
+    }
+    missing_average = {
+        "text": "metric    -", "tsv": "metric\t-\t-", "latex": "metric & - & -"
+    }
     for output_format in ("text", "tsv", "latex"):
       with self.subTest(output_format=output_format):
         table = SCRIPT._point_estimate_table(
             metrics=["metric"],
-            average_column={"metric": (0.5, 1)},
-            task_columns=[{"metric": (0.6, 17)}],
+            average_column={"metric": (None, None)},
+            task_columns=[{"metric": (0.6, 17)}, {}],
             column_headers=[
-                ["", "", "en-de"],
-                ["metric", "Avg", "sys (SPA)"],
+                ["", "", "en-de", "zh-en"],
+                ["metric", "Avg", "sys (SPA)", "sys (SPA)"],
             ],
             output_format=output_format,
             baselines_metainfo=SimpleNamespace(baseline_metrics=set()),
+            separator_after_metric="metric",
         )
         self.assertIn("0.600", table)
         self.assertNotIn("17", table)
+        self.assertIn(missing_cell[output_format], table)
+        self.assertIn(missing_average[output_format], table)
+        if output_format == "latex":
+          self.assertEqual(table.count("\\midrule"), 2)
+        elif output_format == "tsv":
+          self.assertIn("-----\t-----", table)
+        else:
+          separators = [
+              line for line in table.splitlines()
+              if line and not line.replace("-", "").strip()
+          ]
+          self.assertEqual(len(separators), 2)
 
 
 if __name__ == "__main__":

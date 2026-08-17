@@ -129,6 +129,15 @@ failed; inspect its log and do not start the scorer yet.
 Pass one `--base-url` for each replica. Repeating the option enables multiple
 servers; passing it once retains the original single-server behavior.
 
+Reusable model launch commands are stored as `.txt` files under
+`run_scripts/`. Run from that directory, they create the sibling `../runs/`
+directory and write scorer outputs there. If you use the inline commands below
+from the repository root instead, create that directory first:
+
+```bash
+mkdir -p runs
+```
+
 First validate alignment, workload, and maximum prompt size without contacting
 the model server or writing output:
 
@@ -153,7 +162,7 @@ uv run --frozen python scripts/score_wmt23_gemba_v2.py \
   --max-tokens 4096 \
   --limit 12 \
   --max-inflight-judgements 4 \
-  --output-dir gemba-v2-pilot
+  --output-dir runs/gemba-v2-pilot
 ```
 
 For the full paper-style run, score all three language pairs and all MTME
@@ -170,9 +179,9 @@ nohup uv run --frozen python scripts/score_wmt23_gemba_v2.py \
   --max-tokens 4096 \
   --seed 0 \
   --max-inflight-judgements 128 \
-  --output-dir gemba-v2-all-qwen35-t04-n10-4k \
-  > gemba-v2-all-qwen35-t04-n10-4k.log 2>&1 &
-echo $! > gemba-v2-all-qwen35-t04-n10-4k.pid
+  --output-dir runs/gemba-v2-all-qwen35-t04-n10-4k \
+  > runs/gemba-v2-all-qwen35-t04-n10-4k.log 2>&1 &
+echo $! > runs/gemba-v2-all-qwen35-t04-n10-4k.pid
 ```
 
 `--max-inflight-judgements` is a hard per-endpoint generation budget. The
@@ -197,12 +206,12 @@ owns all output files and retries.
 Follow the full run with:
 
 ```bash
-tail -f gemba-v2-all-qwen35-t04-n10-4k.log
+tail -f runs/gemba-v2-all-qwen35-t04-n10-4k.log
 ```
 
 The full run contains 68,130 segments and 681,300 independent `n=1` API
 requests. Successful judgments are flushed immediately to
-`gemba-v2-all-qwen35-t04-n10-4k/judgements/*.jsonl`. After a language pair is
+`runs/gemba-v2-all-qwen35-t04-n10-4k/judgements/*.jsonl`. After a language pair is
 complete, its JSONL file is atomically replaced by a verified `*.jsonl.zip`
 archive. The uncompressed JSONL remains untouched until the temporary ZIP has
 been closed and CRC-checked, so interruption during compression cannot destroy
@@ -226,20 +235,41 @@ Add the saved judgments directly to the reproduced table with:
 ```bash
 uv run --frozen python scripts/reproduce_table3.py \
   --permutations 0 \
-  --gemba-output-dir gemba-v2-all-qwen35-t04-n10-4k \
+  --gemba-output-dir runs/gemba-v2-all-qwen35-t04-n10-4k \
   --allow-incomplete \
   --output table3-with-gemba-v2.txt
 ```
+
+Repeat `--gemba-output-dir` to place several locally generated rows at the top
+of one jointly ranked table:
+
+```bash
+uv run --frozen python scripts/reproduce_table3.py \
+    --permutations 0 \
+    --gemba-output-dir runs/gemba-v2-all-qwen35-122b-a10b-fp8-t04-n10-4k \
+    --gemba-output-dir runs/gemba-v2-all-qwen38-27b-t04-n10-4k \
+    --gemba-output-dir runs/gemba-v2-all-gemma4-31b-t04-n10-4k \
+    --gemba-output-dir runs/gemba-v2-all-nemotron35-lightning-30b-a3b-bf16-t04-n10-4k \
+    --gemba-output-dir runs/gemba-v2-all-qwen35-35b-a3b-fp8-t04-n10-4k/ \
+    --allow-incomplete \
+    --output table3-all-local-models.txt
+```
+
+The local rows retain their manifest-derived names, are ordered by decreasing
+average at the top, and are followed by one separator. Their displayed ranks
+are still global ranks against every row in the combined table.
 
 The Table 3 script reads the compressed judgment files, applies GEMBA's
 aggregation function in memory, and adds the resulting source-based segment
 metric directly to MTME. If a historical or interrupted run has fewer than the
 requested judgments for a segment, it aggregates those available; a segment
 with no judgments is estimated as its system mean plus its segment mean minus
-the language-pair mean, capped at zero. The script reports the exact backoff
-counts. The local row name is derived from the model recorded in the run
-manifest; the command above produces
-`gemba-v2-qwen3.5-35b-a3b-fp8-rrwa[noref]`. For comparison, the table also
+the language-pair mean, capped at zero. If an entire language pair has no saved
+judgments, `--allow-incomplete` leaves its task values as `-` and computes the
+local row's average as `-`. The script reports the exact backoff counts. The
+local row name is derived from the model recorded in the run manifest; the
+command above produces
+`gemba-v2-qwen3.5-35b-a3b-fp8-rrwa(n=10)[noref]`. For comparison, the table also
 includes the published `gemba-v2-gpt-4.1-mini-rrwa[noref]` Table 3 row. That
 official row uses the paper's reported aggregate values because its underlying
 segment judgments are not in the WMT23 MTME bundle. No derived metric-score

@@ -9,8 +9,6 @@ __pycache__/
 nohup.out
 GEMBA_v2/
 wmt25-general-mt/
-gemba-v2-*/
-table3-*.txt
 results.txt*
 raw/
 errors/

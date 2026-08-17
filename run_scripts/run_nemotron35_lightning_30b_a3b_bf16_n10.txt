@@ -1,0 +1,28 @@
+mkdir -p ../runs
+
+nohup uv run --frozen --group serve vllm serve \
+  nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16 \
+  --port 8000 \
+  --generation-config vllm \
+  --max-model-len 32768 \
+  --enable-prefix-caching \
+  --async-scheduling \
+  --mamba-backend flashinfer \
+  --mamba-ssm-cache-dtype float16 \
+  --enable-mamba-cache-stochastic-rounding \
+  --mamba-cache-philox-rounds 5 \
+  --default-chat-template-kwargs '{"enable_thinking": false}' \
+  --max-num-seqs 128 \
+  --max-num-batched-tokens 16384 \
+  > vllm-nemotron35-lightning-30b-a3b-bf16.log 2>&1 &
+
+nohup uv run --frozen python ../scripts/score_wmt23_gemba_v2.py \
+  --model nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16 \
+  --base-url http://127.0.0.1:8000/v1 \
+  --num-judgements 10 \
+  --temperature 0.4 \
+  --max-tokens 4096 \
+  --seed 0 \
+  --max-inflight-judgements 1024 \
+  --output-dir ../runs/gemba-v2-all-nemotron35-lightning-30b-a3b-bf16-t04-n10-4k \
+  > ../runs/gemba-v2-all-nemotron35-lightning-30b-a3b-bf16-t04-n10-4k.log 2>&1 &

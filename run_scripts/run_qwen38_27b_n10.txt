@@ -1,0 +1,25 @@
+mkdir -p ../runs
+
+nohup uvx --from vllm vllm serve \
+  Qwen/Qwen3.8-27B \
+  --port 8000 \
+  --generation-config vllm \
+  --max-model-len 32768 \
+  --language-model-only \
+  --enable-prefix-caching \
+  --reasoning-parser qwen3 \
+  --default-chat-template-kwargs '{"enable_thinking": false}' \
+  --max-num-seqs 1024 \
+  --max-num-batched-tokens 16384 \
+  > vllm-qwen38-27b.log 2>&1 &
+
+nohup uv run --frozen python ../scripts/score_wmt23_gemba_v2.py \
+  --model Qwen/Qwen3.8-27B \
+  --base-url http://127.0.0.1:8000/v1 \
+  --num-judgements 10 \
+  --temperature 0.4 \
+  --max-tokens 4096 \
+  --seed 0 \
+  --max-inflight-judgements 1024 \
+  --output-dir ../runs/gemba-v2-all-qwen38-27b-t04-n10-4k \
+  > ../runs/gemba-v2-all-qwen38-27b-t04-n10-4k.log 2>&1 &
