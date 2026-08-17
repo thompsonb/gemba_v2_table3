@@ -47,6 +47,7 @@ class ArgumentsTest(unittest.TestCase):
     self.assertIn("prismRef", SCRIPT.TABLE3_METRICS)
     self.assertNotIn("MS-COMET-QE-22[noref]", SCRIPT.TABLE3_METRICS)
     self.assertFalse(any("gemba-v2" in m.lower() for m in SCRIPT.TABLE3_METRICS))
+    self.assertEqual(SCRIPT.ADDED_TOP_METRICS, ("chrF",))
 
   def test_local_gemba_metric_name_comes_from_manifest_model(self):
     first = SCRIPT._gemba_metric_name("publisher/First Model", 3)
@@ -245,7 +246,9 @@ class RankingTest(unittest.TestCase):
     local_low = "gemba-v2-second-model-rrwa(n=10)[noref]"
     scores = {
         metric: 0.700 - index / 1000
-        for index, metric in enumerate(SCRIPT.TABLE3_METRICS)
+        for index, metric in enumerate(
+            (*SCRIPT.TABLE3_METRICS, *SCRIPT.ADDED_TOP_METRICS)
+        )
     }
     scores[local_high] = 0.900
     scores[local_low] = 0.100
@@ -288,15 +291,19 @@ class RankingTest(unittest.TestCase):
     low_index = next(
         index for index, line in enumerate(lines) if line.startswith(local_low)
     )
+    chrf_index = next(
+        index for index, line in enumerate(lines) if line.startswith("chrF")
+    )
     published_index = next(
         index for index, line in enumerate(lines)
         if line.startswith(SCRIPT.PUBLISHED_GEMBA_V2_METRIC)
     )
-    self.assertLess(high_index, low_index)
+    self.assertLess(high_index, chrf_index)
+    self.assertLess(chrf_index, low_index)
     self.assertLess(low_index, published_index)
     self.assertTrue(lines[low_index + 1].replace("-", "").strip() == "")
     self.assertIn(" 1 0.900", lines[high_index])
-    self.assertIn("32 0.100", lines[low_index])
+    self.assertIn("33 0.100", lines[low_index])
 
   def test_duplicate_local_metric_names_are_rejected(self):
     with self.assertRaisesRegex(ValueError, "Duplicate local GEMBA"):

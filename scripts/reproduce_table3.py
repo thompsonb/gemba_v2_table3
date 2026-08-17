@@ -91,6 +91,11 @@ TABLE3_METRICS = (
     "prismRef",
 )
 
+# Stored metrics added to the locally reproduced table above the separator.
+ADDED_TOP_METRICS = (
+    "chrF",
+)
+
 
 def _nonnegative_int(value: str) -> int:
   parsed = int(value)
@@ -658,13 +663,14 @@ def _build_table(
   if len(set(local_gemba_metrics)) != len(local_gemba_metrics):
     raise ValueError("Duplicate local GEMBA metric names")
   average_scores = dict(results.AverageCorrs(weights))
-  requested_metrics = list(TABLE3_METRICS)
+  requested_metrics = [*TABLE3_METRICS, *ADDED_TOP_METRICS]
   if local_gemba_metrics:
     requested_metrics.extend((PUBLISHED_GEMBA_V2_METRIC, *local_gemba_metrics))
     average_scores[PUBLISHED_GEMBA_V2_METRIC] = (
         PUBLISHED_GEMBA_V2_AVERAGE
     )
   local_gemba_metric_set = set(local_gemba_metrics)
+  top_metric_set = local_gemba_metric_set | set(ADDED_TOP_METRICS)
   missing = [
       metric for metric in requested_metrics
       if metric not in average_scores and metric not in local_gemba_metric_set
@@ -690,11 +696,11 @@ def _build_table(
   for metric in local_gemba_metrics:
     if metric not in average_scores:
       average_column[metric] = (None, None)
-  local_metric_block = [
-      metric for metric in ranked_metrics if metric in local_gemba_metric_set
+  top_metric_block = [
+      metric for metric in ranked_metrics if metric in top_metric_set
   ]
-  metrics = local_metric_block + [
-      metric for metric in ranked_metrics if metric not in local_gemba_metric_set
+  metrics = top_metric_block + [
+      metric for metric in ranked_metrics if metric not in top_metric_set
   ]
 
   language_header = ["", ""] + [
@@ -730,7 +736,7 @@ def _build_table(
         output_format,
         meta_info_module.WMT23,
         separator_after_metric=(
-            local_metric_block[-1] if local_metric_block else None
+            top_metric_block[-1] if top_metric_block else None
         ),
     )
   return tasks_module.MetricsTable(
